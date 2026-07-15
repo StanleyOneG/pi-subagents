@@ -96,6 +96,22 @@ test("direct @earendil-works runtime imports are declared for CI installs", () =
 	assert.deepEqual(missing, []);
 });
 
+test("skill manifest runtime imports are production dependencies with exact Pi-compatible pins", () => {
+	const packageJson = JSON.parse(fs.readFileSync(path.join(projectRoot, "package.json"), "utf-8"));
+	const skillResolver = fs.readFileSync(path.join(projectRoot, "src", "agents", "skills.ts"), "utf-8");
+	const expected = {
+		glob: "13.0.6",
+		minimatch: "10.2.5",
+		ignore: "7.0.5",
+	};
+
+	for (const [dependency, version] of Object.entries(expected)) {
+		assert.match(skillResolver, new RegExp(`from ["']${dependency}["']`));
+		assert.equal(packageJson.dependencies?.[dependency], version, `${dependency} must be a production dependency`);
+		assert.equal(packageJson.devDependencies?.[dependency], undefined, `${dependency} must not rely on devDependencies`);
+	}
+});
+
 test("direct dependency declarations are exact version pins", () => {
 	const packageJson = JSON.parse(fs.readFileSync(path.join(projectRoot, "package.json"), "utf-8"));
 

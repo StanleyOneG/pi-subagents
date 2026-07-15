@@ -972,6 +972,8 @@ Discovery uses project-first precedence:
 6. User packages and user settings packages via `package.json -> pi.skills`
 7. `~/.pi/agent/settings.json -> skills`
 
+Package-manifest `pi.skills` sources honor Pi `*`/`?` globs plus `!` exclusions, exact `+` re-inclusions, and exact `-` exclusions. Object-form settings-package filters and `autoload` remain outside this resolver.
+
 Use agent defaults, override them at runtime, or disable them:
 
 ```ts

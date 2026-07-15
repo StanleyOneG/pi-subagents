@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Fixed
+- Honored Pi package-manifest `pi.skills` source globs and `!`/`+`/`-` override patterns during subagent skill discovery.
 - Kept pi-intercom stable IDs from leaking into child sessions and used the current intercom runtime ID for unnamed supervisor targets.
 - Improved acceptance policy validation errors and tool-schema guidance for invalid evidence kinds. Thanks to @atimofeev for #672.
 - Tolerated temporary steering inbox scan failures so pending steer requests can be retried on the next poll. Thanks to @hughcars for #670.

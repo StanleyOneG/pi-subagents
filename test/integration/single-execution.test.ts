@@ -261,6 +261,40 @@ function writePackageSkill(packageRoot: string, skillName: string): void {
 	);
 }
 
+const STAN_REVIEWER_SKILLS = [
+	"review-plan",
+	"review-diff-before-final",
+	"validate-code-change",
+	"codeguard",
+	"codeguard-reviewer",
+	"trace-work",
+];
+
+function writeStanReviewerGitPackage(projectDir: string): string {
+	const packageRoot = path.join(projectDir, ".pi", "git", "github.com", "StanleyOneG", "stan_stack");
+	fs.mkdirSync(packageRoot, { recursive: true });
+	fs.writeFileSync(
+		path.join(packageRoot, "package.json"),
+		JSON.stringify({ name: "stan_stack", version: "0.4.0", pi: { skills: [".pi/skills/*/SKILL.md"] } }, null, 2),
+		"utf-8",
+	);
+	for (const skillName of STAN_REVIEWER_SKILLS) {
+		const skillDir = path.join(packageRoot, ".pi", "skills", skillName);
+		fs.mkdirSync(skillDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(skillDir, "SKILL.md"),
+			`---\nname: ${skillName}\ndescription: ${skillName} skill\n---\nbody\n`,
+			"utf-8",
+		);
+	}
+	fs.writeFileSync(
+		path.join(projectDir, ".pi", "settings.json"),
+		JSON.stringify({ packages: ["git:github.com/StanleyOneG/stan_stack@v0.4.0"] }, null, 2),
+		"utf-8",
+	);
+	return packageRoot;
+}
+
 describe("single sync execution", { skip: !available ? "pi packages not available" : undefined }, () => {
 	let tempDir: string;
 	let mockPi: MockPi;
@@ -2113,6 +2147,38 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const prompt = readCall().systemPrompts.map((record) => record.text ?? "").join("\n");
 		assert.match(prompt, /local skill description/);
 		assert.match(prompt, new RegExp(escapeRegExp(skillFile)));
+	});
+
+	it("injects Stan reviewer skills from a git-package manifest glob without warnings", async () => {
+		const packageRoot = writeStanReviewerGitPackage(tempDir);
+		const agents = [makeAgent("stan-reviewer", { skills: STAN_REVIEWER_SKILLS })];
+		mockPi.onCall({ output: "Reviewed" });
+		mockPi.onCall({ output: "Reviewed with missing skill" });
+
+		const resolvedResult = await runSync(tempDir, agents, "stan-reviewer", "Review the change", {});
+		assert.equal(resolvedResult.exitCode, 0);
+		assert.deepEqual(resolvedResult.skills, STAN_REVIEWER_SKILLS);
+		assert.equal(resolvedResult.skillsWarning, undefined);
+
+		const systemPrompt = readCall().systemPrompts[0]?.text ?? "";
+		for (const skillName of STAN_REVIEWER_SKILLS) {
+			assert.match(systemPrompt, new RegExp(`<name>${escapeRegExp(skillName)}</name>`));
+			assert.match(
+				systemPrompt,
+				new RegExp(`<location>${escapeRegExp(path.join(packageRoot, ".pi", "skills", skillName, "SKILL.md"))}</location>`),
+			);
+		}
+
+		const missingResult = await runSync(
+			tempDir,
+			[makeAgent("stan-reviewer", { skills: [...STAN_REVIEWER_SKILLS, "truly-missing-skill"] })],
+			"stan-reviewer",
+			"Review the change",
+			{},
+		);
+		assert.equal(missingResult.exitCode, 0);
+		assert.deepEqual(missingResult.skills, STAN_REVIEWER_SKILLS);
+		assert.equal(missingResult.skillsWarning, "Skills not found: truly-missing-skill");
 	});
 
 	it("falls back to the runtime cwd when the task cwd lacks a skill", async () => {

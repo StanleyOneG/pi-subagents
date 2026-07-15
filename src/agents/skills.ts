@@ -6,6 +6,9 @@ import { execSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { globSync } from "glob";
+import ignore from "ignore";
+import { minimatch } from "minimatch";
 import { getAgentDir, getProjectConfigDir } from "../shared/utils.ts";
 
 export type SkillSource =
@@ -40,9 +43,20 @@ interface CachedSkillEntry {
 	order: number;
 }
 
+interface PackageManifestSkillConfig {
+	packageRoot: string;
+	overrides: string[];
+}
+
 interface SkillSearchPath {
 	path: string;
 	source: SkillSource;
+	packageManifest?: PackageManifestSkillConfig;
+}
+
+interface IgnoreMatcher {
+	add(patterns: string[]): unknown;
+	ignores(path: string): boolean;
 }
 
 const skillCache = new Map<string, SkillCacheEntry>();
@@ -104,6 +118,125 @@ function readJsonFileBestEffort(filePath: string): unknown {
 	}
 }
 
+function isManifestOverridePattern(entry: string): boolean {
+	return entry.startsWith("!") || entry.startsWith("+") || entry.startsWith("-");
+}
+
+function hasManifestGlob(entry: string): boolean {
+	return entry.includes("*") || entry.includes("?");
+}
+
+const IGNORE_FILE_NAMES = [".gitignore", ".ignore", ".fdignore"];
+
+function toPosixPath(value: string): string {
+	return value.replace(/\\/g, "/");
+}
+
+function prefixIgnorePattern(line: string, prefix: string): string | null {
+	const trimmed = line.trim();
+	if (!trimmed) return null;
+	if (trimmed.startsWith("#") && !trimmed.startsWith("\\#")) return null;
+
+	let pattern = line;
+	let negated = false;
+	if (pattern.startsWith("!")) {
+		negated = true;
+		pattern = pattern.slice(1);
+	} else if (pattern.startsWith("\\!")) {
+		pattern = pattern.slice(1);
+	}
+	if (pattern.startsWith("/")) pattern = pattern.slice(1);
+
+	const prefixed = prefix ? `${prefix}${pattern}` : pattern;
+	return negated ? `!${prefixed}` : prefixed;
+}
+
+function addManifestIgnoreRules(ignoreMatcher: IgnoreMatcher, dirPath: string, rootPath: string): void {
+	const relativeDir = path.relative(rootPath, dirPath);
+	const prefix = relativeDir ? `${toPosixPath(relativeDir)}/` : "";
+
+	for (const fileName of IGNORE_FILE_NAMES) {
+		const ignorePath = path.join(dirPath, fileName);
+		if (!fs.existsSync(ignorePath)) continue;
+		try {
+			const patterns = fs.readFileSync(ignorePath, "utf-8")
+				.split(/\r?\n/)
+				.map((line) => prefixIgnorePattern(line, prefix))
+				.filter((line): line is string => line !== null);
+			if (patterns.length > 0) ignoreMatcher.add(patterns);
+		} catch {
+			// Ignore files are optional best-effort package metadata.
+		}
+	}
+}
+
+function matchesManifestPattern(filePath: string, patterns: string[], packageRoot: string): boolean {
+	const relativePath = toPosixPath(path.relative(packageRoot, filePath));
+	const name = path.basename(filePath);
+	const absolutePath = toPosixPath(filePath);
+	const isSkillFile = name === "SKILL.md";
+	const parentDir = isSkillFile ? path.dirname(filePath) : undefined;
+	const parentRelativePath = isSkillFile ? toPosixPath(path.relative(packageRoot, parentDir)) : undefined;
+	const parentName = isSkillFile ? path.basename(parentDir) : undefined;
+	const parentAbsolutePath = isSkillFile ? toPosixPath(parentDir) : undefined;
+
+	return patterns.some((pattern) => {
+		const normalizedPattern = toPosixPath(pattern);
+		if (
+			minimatch(relativePath, normalizedPattern)
+			|| minimatch(name, normalizedPattern)
+			|| minimatch(absolutePath, normalizedPattern)
+		) {
+			return true;
+		}
+		if (!isSkillFile) return false;
+		return (
+			minimatch(parentRelativePath!, normalizedPattern)
+			|| minimatch(parentName!, normalizedPattern)
+			|| minimatch(parentAbsolutePath!, normalizedPattern)
+		);
+	});
+}
+
+function normalizeExactManifestPattern(pattern: string): string {
+	const withoutRelativePrefix = pattern.startsWith("./") || pattern.startsWith(".\\")
+		? pattern.slice(2)
+		: pattern;
+	return toPosixPath(withoutRelativePrefix);
+}
+
+function matchesExactManifestPattern(filePath: string, patterns: string[], packageRoot: string): boolean {
+	const relativePath = toPosixPath(path.relative(packageRoot, filePath));
+	const name = path.basename(filePath);
+	const absolutePath = toPosixPath(filePath);
+	const isSkillFile = name === "SKILL.md";
+	const parentDir = isSkillFile ? path.dirname(filePath) : undefined;
+	const parentRelativePath = isSkillFile ? toPosixPath(path.relative(packageRoot, parentDir)) : undefined;
+	const parentAbsolutePath = isSkillFile ? toPosixPath(parentDir) : undefined;
+
+	return patterns.some((pattern) => {
+		const normalizedPattern = normalizeExactManifestPattern(pattern);
+		if (normalizedPattern === relativePath || normalizedPattern === absolutePath) return true;
+		if (!isSkillFile) return false;
+		return normalizedPattern === parentRelativePath || normalizedPattern === parentAbsolutePath;
+	});
+}
+
+function isEnabledByManifestOverrides(filePath: string, packageManifest: PackageManifestSkillConfig | undefined): boolean {
+	if (!packageManifest) return true;
+
+	const { packageRoot, overrides } = packageManifest;
+	const exclusions = overrides.filter((pattern) => pattern.startsWith("!")).map((pattern) => pattern.slice(1));
+	const forceIncludes = overrides.filter((pattern) => pattern.startsWith("+")).map((pattern) => pattern.slice(1));
+	const forceExclusions = overrides.filter((pattern) => pattern.startsWith("-")).map((pattern) => pattern.slice(1));
+
+	let enabled = true;
+	if (exclusions.length > 0 && matchesManifestPattern(filePath, exclusions, packageRoot)) enabled = false;
+	if (forceIncludes.length > 0 && matchesExactManifestPattern(filePath, forceIncludes, packageRoot)) enabled = true;
+	if (forceExclusions.length > 0 && matchesExactManifestPattern(filePath, forceExclusions, packageRoot)) enabled = false;
+	return enabled;
+}
+
 function extractSkillPathsFromPackageRoot(packageRoot: string, source: SkillSource, bestEffort = false): SkillSearchPath[] {
 	const packageJsonPath = path.join(packageRoot, "package.json");
 	const pkg = bestEffort
@@ -114,9 +247,19 @@ function extractSkillPathsFromPackageRoot(packageRoot: string, source: SkillSour
 	if (!pi || typeof pi !== "object" || Array.isArray(pi)) return [];
 	const skills = (pi as { skills?: unknown }).skills;
 	if (!Array.isArray(skills)) return [];
-	return skills
-		.filter((entry): entry is string => typeof entry === "string")
-		.map((entry) => ({ path: path.resolve(packageRoot, entry), source }));
+
+	const entries = skills.filter((entry): entry is string => typeof entry === "string");
+	const overrides = entries.filter(isManifestOverridePattern);
+	const packageManifest = { packageRoot: path.resolve(packageRoot), overrides };
+
+	return entries
+		.filter((entry) => !isManifestOverridePattern(entry))
+		.flatMap((entry) => {
+			const paths = hasManifestGlob(entry)
+				? globSync(entry, { cwd: packageRoot, absolute: true, dot: false, nodir: false }).map((match) => path.resolve(match))
+				: [path.resolve(packageRoot, entry)];
+			return paths.map((entryPath) => ({ path: entryPath, source, packageManifest }));
+		});
 }
 
 let cachedGlobalNpmRoot: string | null = null;
@@ -333,15 +476,30 @@ function buildSkillPaths(cwd: string, agentDir: string): SkillSearchPath[] {
 		...collectSettingsSkillPaths(cwd, agentDir),
 	];
 
-	const deduped = new Map<string, SkillSearchPath>();
+	const paths: SkillSearchPath[] = [];
+	const nonManifestPathIndexes = new Map<string, number>();
 	for (const entry of skillPaths) {
 		const resolvedPath = path.resolve(entry.path);
-		const existing = deduped.get(resolvedPath);
+		const resolvedEntry = { ...entry, path: resolvedPath };
+		if (entry.packageManifest) {
+			// Each package manifest filters its own discovered files. Do not collapse
+			// distinct package roots or override vectors before that filtering occurs.
+			paths.push(resolvedEntry);
+			continue;
+		}
+
+		const existingIndex = nonManifestPathIndexes.get(resolvedPath);
+		const existing = existingIndex === undefined ? undefined : paths[existingIndex];
 		if (!existing || (SOURCE_PRIORITY[entry.source] ?? 0) > (SOURCE_PRIORITY[existing.source] ?? 0)) {
-			deduped.set(resolvedPath, { path: resolvedPath, source: entry.source });
+			if (existingIndex === undefined) {
+				nonManifestPathIndexes.set(resolvedPath, paths.length);
+				paths.push(resolvedEntry);
+			} else {
+				paths[existingIndex] = resolvedEntry;
+			}
 		}
 	}
-	return [...deduped.values()];
+	return paths;
 }
 
 function inferSkillSource(filePath: string, cwd: string, agentDir: string, sourceHint?: SkillSource): SkillSource {
@@ -403,12 +561,16 @@ function maybeReadSkillDescription(filePath: string): string | undefined {
 function collectFilesystemSkills(cwd: string, agentDir: string, skillPaths: SkillSearchPath[]): CachedSkillEntry[] {
 	const entries: CachedSkillEntry[] = [];
 	const seen = new Map<string, number>();
-	const visitedDirectories = new Map<string, number>();
 	let order = 0;
 
-	const pushEntry = (name: string, filePath: string, sourceHint?: SkillSource) => {
+	const pushEntry = (
+		name: string,
+		filePath: string,
+		sourceHint?: SkillSource,
+		packageManifest?: PackageManifestSkillConfig,
+	) => {
 		const resolvedFile = path.resolve(filePath);
-		if (!fs.existsSync(resolvedFile)) return;
+		if (!fs.existsSync(resolvedFile) || !isEnabledByManifestOverrides(resolvedFile, packageManifest)) return;
 		const source = inferSkillSource(resolvedFile, cwd, agentDir, sourceHint);
 		const existingIndex = seen.get(resolvedFile);
 		if (existingIndex !== undefined) {
@@ -435,108 +597,103 @@ function collectFilesystemSkills(cwd: string, agentDir: string, skillPaths: Skil
 
 	const shouldSkipDirectory = (name: string) => name.startsWith(".") || name === "node_modules";
 
-	const markDirectoryVisited = (dirPath: string, sourceHint?: SkillSource): boolean => {
-		let resolvedDir: string;
-		try {
-			resolvedDir = fs.realpathSync(dirPath);
-		} catch {
-			resolvedDir = path.resolve(dirPath);
-		}
-		const priority = sourceHint ? SOURCE_PRIORITY[sourceHint] ?? 0 : SOURCE_PRIORITY.unknown;
-		const previousPriority = visitedDirectories.get(resolvedDir);
-		if (previousPriority !== undefined && previousPriority >= priority) return false;
-		visitedDirectories.set(resolvedDir, priority);
-		return true;
-	};
-
-	const walkSkillDirectories = (dirPath: string, sourceHint?: SkillSource) => {
-		if (!markDirectoryVisited(dirPath, sourceHint)) return;
-
-		const skillFile = path.join(dirPath, "SKILL.md");
-		if (fs.existsSync(skillFile)) {
-			pushEntry(path.basename(dirPath), skillFile, sourceHint);
-			return;
-		}
-
-		let entriesInDir: fs.Dirent[];
-		try {
-			entriesInDir = fs.readdirSync(dirPath, { withFileTypes: true });
-		} catch {
-			return;
-		}
-
-		for (const entry of entriesInDir) {
-			if (shouldSkipDirectory(entry.name)) continue;
-			if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
-
-			const entryPath = path.join(dirPath, entry.name);
-			let stat: fs.Stats;
-			try {
-				stat = fs.statSync(entryPath);
-			} catch {
-				continue;
-			}
-			if (stat.isDirectory()) {
-				walkSkillDirectories(entryPath, sourceHint);
-			}
-		}
-	};
-
 	for (const skillPath of skillPaths) {
 		if (!fs.existsSync(skillPath.path)) continue;
 
-		let stat: fs.Stats;
+		let rootStat: fs.Stats;
 		try {
-			stat = fs.statSync(skillPath.path);
+			rootStat = fs.statSync(skillPath.path);
 		} catch {
 			continue;
 		}
 
-		if (stat.isFile()) {
+		if (rootStat.isFile()) {
 			const fileName = path.basename(skillPath.path);
-			if (!fileName.toLowerCase().endsWith(".md")) continue;
+			const isSupportedManifestFile = fileName.endsWith(".md");
+			const isSupportedNonManifestFile = fileName.toLowerCase().endsWith(".md");
+			if (skillPath.packageManifest ? !isSupportedManifestFile : !isSupportedNonManifestFile) continue;
 			const skillName = fileName.toLowerCase() === "skill.md"
 				? path.basename(path.dirname(skillPath.path))
 				: path.basename(fileName, path.extname(fileName));
-			pushEntry(skillName, skillPath.path, skillPath.source);
+			// Pi collects direct manifest files before applying directory ignore rules.
+			pushEntry(skillName, skillPath.path, skillPath.source, skillPath.packageManifest);
 			continue;
 		}
+		if (!rootStat.isDirectory()) continue;
 
-		if (!stat.isDirectory()) continue;
+		const activeDirectoryIdentities = new Set<string>();
+		const ignoreMatcher: IgnoreMatcher | undefined = skillPath.packageManifest ? ignore() : undefined;
 
-		const rootSkillFile = path.join(skillPath.path, "SKILL.md");
-		if (fs.existsSync(rootSkillFile)) {
-			pushEntry(path.basename(skillPath.path), rootSkillFile, skillPath.source);
-			continue;
-		}
+		const getDirectoryIdentity = (dirPath: string): string => {
+			try {
+				return fs.realpathSync(dirPath);
+			} catch {
+				return path.resolve(dirPath);
+			}
+		};
 
-		markDirectoryVisited(skillPath.path, skillPath.source);
+		const isIgnored = (entryPath: string, isDirectory: boolean, rootPath: string): boolean => {
+			if (!ignoreMatcher) return false;
+			const relativePath = toPosixPath(path.relative(rootPath, entryPath));
+			return ignoreMatcher.ignores(isDirectory ? `${relativePath}/` : relativePath);
+		};
 
-		let childEntries: fs.Dirent[];
-		try {
-			childEntries = fs.readdirSync(skillPath.path, { withFileTypes: true });
-		} catch {
-			continue;
-		}
+		const walkSkillDirectories = (dirPath: string, rootPath: string) => {
+			const directoryIdentity = getDirectoryIdentity(dirPath);
+			if (activeDirectoryIdentities.has(directoryIdentity)) return;
+			activeDirectoryIdentities.add(directoryIdentity);
+			try {
+				if (ignoreMatcher) addManifestIgnoreRules(ignoreMatcher, dirPath, rootPath);
 
-		for (const child of childEntries) {
-			if (child.name.startsWith(".")) continue;
-			const childPath = path.join(skillPath.path, child.name);
-			if (child.isDirectory() || child.isSymbolicLink()) {
-				if (shouldSkipDirectory(child.name)) continue;
-				let childStat: fs.Stats;
+				const skillFile = path.join(dirPath, "SKILL.md");
 				try {
-					childStat = fs.statSync(childPath);
+					if (fs.statSync(skillFile).isFile() && !isIgnored(skillFile, false, rootPath)) {
+						pushEntry(path.basename(dirPath), skillFile, skillPath.source, skillPath.packageManifest);
+						return;
+					}
 				} catch {
-					continue;
+					// No readable SKILL.md anchor; inspect children instead.
 				}
-				if (childStat.isDirectory()) walkSkillDirectories(childPath, skillPath.source);
-				continue;
+
+				let entriesInDir: fs.Dirent[];
+				try {
+					entriesInDir = fs.readdirSync(dirPath, { withFileTypes: true });
+				} catch {
+					return;
+				}
+
+				for (const entry of entriesInDir) {
+					if (shouldSkipDirectory(entry.name)) continue;
+
+					const entryPath = path.join(dirPath, entry.name);
+					let stat: fs.Stats;
+					try {
+						stat = fs.statSync(entryPath);
+					} catch {
+						continue;
+					}
+
+					if (stat.isDirectory()) {
+						if (!isIgnored(entryPath, true, rootPath)) walkSkillDirectories(entryPath, rootPath);
+						continue;
+					}
+					const isSupportedManifestMarkdown = entry.name.endsWith(".md");
+					const isSupportedNonManifestMarkdown = entry.name.toLowerCase().endsWith(".md");
+					if (
+						stat.isFile()
+						&& dirPath === rootPath
+						&& (skillPath.packageManifest ? isSupportedManifestMarkdown : isSupportedNonManifestMarkdown)
+						&& !isIgnored(entryPath, false, rootPath)
+					) {
+						pushEntry(path.basename(entry.name, path.extname(entry.name)), entryPath, skillPath.source, skillPath.packageManifest);
+					}
+				}
+			} finally {
+				activeDirectoryIdentities.delete(directoryIdentity);
 			}
-			if (child.isFile() && child.name.toLowerCase().endsWith(".md")) {
-				pushEntry(path.basename(child.name, path.extname(child.name)), childPath, skillPath.source);
-			}
-		}
+		};
+
+		walkSkillDirectories(skillPath.path, skillPath.path);
 	}
 
 	return entries;

@@ -15,6 +15,15 @@ import {
 
 let tempDir = "";
 
+const STAN_REVIEWER_SKILLS = [
+	"review-plan",
+	"review-diff-before-final",
+	"validate-code-change",
+	"codeguard",
+	"codeguard-reviewer",
+	"trace-work",
+];
+
 function writeSkillFile(skillDir: string, body: string, description = "Test description"): void {
 	fs.mkdirSync(skillDir, { recursive: true });
 	fs.writeFileSync(
@@ -43,6 +52,19 @@ function makePackageSkill(packageRoot: string, name: string, body: string, packa
 		"utf-8",
 	);
 	fs.writeFileSync(path.join(skillDir, "SKILL.md"), `${body}\n`, "utf-8");
+}
+
+function writePackageManifest(packageRoot: string, skills: string[], packageName = "test-skill-package"): void {
+	fs.mkdirSync(packageRoot, { recursive: true });
+	fs.writeFileSync(
+		path.join(packageRoot, "package.json"),
+		JSON.stringify({ name: packageName, version: "1.0.0", pi: { skills } }, null, 2),
+		"utf-8",
+	);
+}
+
+function makeManifestSkill(packageRoot: string, skillsDir: string, name: string, body: string): void {
+	writeSkillFile(path.join(packageRoot, skillsDir, name), body, `${name} description`);
 }
 
 async function importSkillsFresh() {
@@ -295,6 +317,269 @@ describe("skills filesystem fallback", () => {
 		assert.equal(resolved[0]?.source, "project-package");
 	});
 
+	it("discovers the six Stan reviewer skills from a one-level Pi manifest glob", () => {
+		const packageRoot = path.join(tempDir, ".pi", "git", "github.com", "StanleyOneG", "stan_stack");
+		writePackageManifest(packageRoot, [".pi/skills/*/SKILL.md"], "stan_stack");
+		for (const skillName of STAN_REVIEWER_SKILLS) {
+			makeManifestSkill(packageRoot, ".pi/skills", skillName, `Use ${skillName}.`);
+		}
+		fs.writeFileSync(path.join(packageRoot, ".pi", "skills", "SKILL-INDEX.md"), "Package skill index.\n", "utf-8");
+		makeManifestSkill(packageRoot, ".pi/skills", ".hidden-skill", "Must not be exposed.");
+		makeManifestSkill(packageRoot, ".pi/skills/group", "nested-skill", "Must not be exposed.");
+		fs.mkdirSync(path.join(tempDir, ".pi"), { recursive: true });
+		fs.writeFileSync(
+			path.join(tempDir, ".pi", "settings.json"),
+			JSON.stringify({ packages: ["git:github.com/StanleyOneG/stan_stack@v0.4.0"] }, null, 2),
+			"utf-8",
+		);
+
+		const { resolved, missing } = resolveSkills(STAN_REVIEWER_SKILLS, tempDir);
+		assert.deepEqual(missing, []);
+		assert.deepEqual(resolved.map((skill) => skill.name), STAN_REVIEWER_SKILLS);
+		assert.deepEqual(resolved.map((skill) => skill.source), STAN_REVIEWER_SKILLS.map(() => "project-package"));
+		assert.deepEqual(
+			resolved.map((skill) => skill.path),
+			STAN_REVIEWER_SKILLS.map((name) => path.join(packageRoot, ".pi", "skills", name, "SKILL.md")),
+		);
+
+		const names = discoverAvailableSkills(tempDir).map((skill) => skill.name);
+		assert.equal(names.includes("SKILL-INDEX"), false);
+		assert.equal(names.includes(".hidden-skill"), false);
+		assert.equal(names.includes("nested-skill"), false);
+	});
+
+	it("honors manifest exclusions, exact re-inclusions, and final exact exclusions for skill paths", () => {
+		const packageRoot = path.join(tempDir, ".pi", "packages", "manifest-overrides");
+		writePackageManifest(packageRoot, [
+			"./skills",
+			"+skills/reinclude",
+			"-skills/final",
+			"-skills/final-*",
+			"!excluded-by-name",
+			"!reinclude",
+			"!final",
+			"!skills/glob-*",
+			"!wildcard-plus",
+			"+skills/wildcard-*",
+			"+skills/final",
+		]);
+		makeManifestSkill(packageRoot, "skills", "kept", "Keep this skill.");
+		makeManifestSkill(packageRoot, "skills", "excluded-by-name", "Exclude this skill by SKILL.md parent name.");
+		makeManifestSkill(packageRoot, "skills", "reinclude", "Reinclude this skill.");
+		makeManifestSkill(packageRoot, "skills", "final", "Exclude this skill after re-inclusion.");
+		makeManifestSkill(packageRoot, "skills", "glob-hidden", "Exclude this skill with a relative glob.");
+		makeManifestSkill(packageRoot, "skills", "wildcard-plus", "Do not re-include this skill with a glob-looking exact path.");
+		makeManifestSkill(packageRoot, "skills", "final-keep", "Do not exclude this skill with a glob-looking exact path.");
+		fs.mkdirSync(path.join(tempDir, ".pi"), { recursive: true });
+		fs.writeFileSync(
+			path.join(tempDir, ".pi", "settings.json"),
+			JSON.stringify({ packages: ["./packages/manifest-overrides"] }, null, 2),
+			"utf-8",
+		);
+
+		const { resolved, missing } = resolveSkills(
+			["kept", "excluded-by-name", "reinclude", "final", "glob-hidden", "wildcard-plus", "final-keep"],
+			tempDir,
+		);
+		assert.deepEqual(resolved.map((skill) => skill.name), ["kept", "reinclude", "final-keep"]);
+		assert.deepEqual(missing, ["excluded-by-name", "final", "glob-hidden", "wildcard-plus"]);
+	});
+
+	it("expands question-mark package-manifest source globs", () => {
+		const packageRoot = path.join(tempDir, ".pi", "packages", "question-glob");
+		writePackageManifest(packageRoot, ["skills/skill-?/SKILL.md"]);
+		makeManifestSkill(packageRoot, "skills", "skill-a", "Question glob skill A.");
+		makeManifestSkill(packageRoot, "skills", "skill-b", "Question glob skill B.");
+		makeManifestSkill(packageRoot, "skills", "skill-aa", "Must not match one question mark.");
+		fs.mkdirSync(path.join(tempDir, ".pi"), { recursive: true });
+		fs.writeFileSync(
+			path.join(tempDir, ".pi", "settings.json"),
+			JSON.stringify({ packages: ["./packages/question-glob"] }, null, 2),
+			"utf-8",
+		);
+
+		const { resolved, missing } = resolveSkills(["skill-a", "skill-b", "skill-aa"], tempDir);
+		assert.deepEqual(resolved.map((skill) => skill.name), ["skill-a", "skill-b"]);
+		assert.deepEqual(missing, ["skill-aa"]);
+	});
+
+	it("keeps direct manifest file discovery Markdown-only", () => {
+		const packageRoot = path.join(tempDir, ".pi", "packages", "direct-files");
+		const skillsRoot = path.join(packageRoot, "skills");
+		writePackageManifest(packageRoot, [
+			"skills/direct.md",
+			"skills/metadata.json",
+			"skills/uppercase.MD",
+			"skills/skill-directory/SKILL.md",
+			"skills/*",
+		]);
+		fs.mkdirSync(skillsRoot, { recursive: true });
+		fs.writeFileSync(path.join(skillsRoot, "direct.md"), "Direct Markdown skill.\n", "utf-8");
+		fs.writeFileSync(path.join(skillsRoot, "broad.md"), "Broad-glob Markdown skill.\n", "utf-8");
+		fs.writeFileSync(path.join(skillsRoot, "metadata.json"), "{}\n", "utf-8");
+		fs.writeFileSync(path.join(skillsRoot, "script.ts"), "export {};\n", "utf-8");
+		fs.writeFileSync(path.join(skillsRoot, "uppercase.MD"), "Not a case-sensitive manifest Markdown match.\n", "utf-8");
+		writeSkillFile(path.join(skillsRoot, "skill-directory"), "Direct SKILL.md manifest match.");
+		fs.mkdirSync(path.join(tempDir, ".pi"), { recursive: true });
+		fs.writeFileSync(
+			path.join(tempDir, ".pi", "settings.json"),
+			JSON.stringify({ packages: ["./packages/direct-files"] }, null, 2),
+			"utf-8",
+		);
+
+		const { resolved, missing } = resolveSkills(
+			["direct", "broad", "skill-directory", "metadata", "script", "uppercase"],
+			tempDir,
+		);
+		assert.deepEqual(resolved.map((skill) => skill.name), ["direct", "broad", "skill-directory"]);
+		assert.deepEqual(missing, ["metadata", "script", "uppercase"]);
+	});
+
+	it("keeps root package-manifest Markdown discovery case-sensitive", () => {
+		const packageRoot = path.join(tempDir, ".pi", "packages", "root-markdown-case");
+		const skillsRoot = path.join(packageRoot, "skills");
+		writePackageManifest(packageRoot, ["./skills"]);
+		fs.mkdirSync(skillsRoot, { recursive: true });
+		fs.writeFileSync(path.join(skillsRoot, "lower.md"), "Pi-compatible lower-case Markdown.\n", "utf-8");
+		fs.writeFileSync(path.join(skillsRoot, "UPPER.MD"), "Must not be exposed by a package manifest directory.\n", "utf-8");
+		fs.mkdirSync(path.join(tempDir, ".pi"), { recursive: true });
+		fs.writeFileSync(
+			path.join(tempDir, ".pi", "settings.json"),
+			JSON.stringify({ packages: ["./packages/root-markdown-case"] }, null, 2),
+			"utf-8",
+		);
+
+		const { resolved, missing } = resolveSkills(["lower", "UPPER"], tempDir);
+		assert.deepEqual(resolved.map((skill) => skill.name), ["lower"]);
+		assert.deepEqual(missing, ["UPPER"]);
+	});
+
+	it("evaluates sibling symlink aliases independently within one manifest traversal", () => {
+		const packageRoot = path.join(tempDir, ".pi", "packages", "sibling-aliases");
+		const sharedRoot = path.join(tempDir, ".pi", "shared-skills");
+		writePackageManifest(packageRoot, ["./skills", "!skills/alias-a/foo", "!skills/alias-b/bar"], "sibling-aliases");
+		makeManifestSkill(sharedRoot, ".", "foo", "Only alias B should expose foo.");
+		makeManifestSkill(sharedRoot, ".", "bar", "Only alias A should expose bar.");
+		const aliasesRoot = path.join(packageRoot, "skills");
+		fs.mkdirSync(aliasesRoot, { recursive: true });
+		fs.symlinkSync(sharedRoot, path.join(aliasesRoot, "alias-a"), process.platform === "win32" ? "junction" : "dir");
+		fs.symlinkSync(sharedRoot, path.join(aliasesRoot, "alias-b"), process.platform === "win32" ? "junction" : "dir");
+		fs.mkdirSync(path.join(tempDir, ".pi"), { recursive: true });
+		fs.writeFileSync(
+			path.join(tempDir, ".pi", "settings.json"),
+			JSON.stringify({ packages: ["./packages/sibling-aliases"] }, null, 2),
+			"utf-8",
+		);
+
+		const { resolved, missing } = resolveSkills(["foo", "bar"], tempDir);
+		assert.deepEqual(missing, []);
+		assert.deepEqual(resolved.map((skill) => skill.path), [
+			path.join(aliasesRoot, "alias-b", "foo", "SKILL.md"),
+			path.join(aliasesRoot, "alias-a", "bar", "SKILL.md"),
+		]);
+	});
+
+	it("filters shared manifest roots independently before deduplicating enabled skill files", () => {
+		const packagesRoot = path.join(tempDir, ".pi", "packages");
+		const packageA = path.join(packagesRoot, "package-a");
+		const packageB = path.join(packagesRoot, "package-b");
+		const sharedRoot = path.join(packagesRoot, "shared-skills");
+		writePackageManifest(packageA, ["../shared-skills", "!from-b"], "package-a");
+		writePackageManifest(packageB, ["../shared-skills", "!from-a"], "package-b");
+		makeManifestSkill(sharedRoot, ".", "from-a", "Enabled by package A.");
+		makeManifestSkill(sharedRoot, ".", "from-b", "Enabled by package B.");
+		fs.mkdirSync(path.join(tempDir, ".pi"), { recursive: true });
+		fs.writeFileSync(
+			path.join(tempDir, ".pi", "settings.json"),
+			JSON.stringify({ packages: ["./packages/package-a", "./packages/package-b"] }, null, 2),
+			"utf-8",
+		);
+
+		const { resolved, missing } = resolveSkills(["from-a", "from-b"], tempDir);
+		assert.deepEqual(missing, []);
+		assert.deepEqual(resolved.map((skill) => skill.name), ["from-a", "from-b"]);
+		assert.deepEqual(resolved.map((skill) => skill.source), ["project-package", "project-package"]);
+	});
+
+	it("traverses symlink aliases independently when package manifests have conflicting overrides", () => {
+		const packagesRoot = path.join(tempDir, ".pi", "packages");
+		const packageA = path.join(packagesRoot, "package-a");
+		const packageB = path.join(packagesRoot, "package-b");
+		const sharedRoot = path.join(packagesRoot, "shared-real");
+		writePackageManifest(packageA, ["./alias-a", "!from-b"], "package-a");
+		writePackageManifest(packageB, ["./alias-b", "!from-a"], "package-b");
+		makeManifestSkill(sharedRoot, ".", "from-a", "Enabled through alias A.");
+		makeManifestSkill(sharedRoot, ".", "from-b", "Enabled through alias B.");
+		fs.symlinkSync(sharedRoot, path.join(packageA, "alias-a"), process.platform === "win32" ? "junction" : "dir");
+		fs.symlinkSync(sharedRoot, path.join(packageB, "alias-b"), process.platform === "win32" ? "junction" : "dir");
+		fs.mkdirSync(path.join(tempDir, ".pi"), { recursive: true });
+		fs.writeFileSync(
+			path.join(tempDir, ".pi", "settings.json"),
+			JSON.stringify({ packages: ["./packages/package-a", "./packages/package-b"] }, null, 2),
+			"utf-8",
+		);
+
+		const { resolved, missing } = resolveSkills(["from-a", "from-b"], tempDir);
+		assert.deepEqual(missing, []);
+		assert.deepEqual(resolved.map((skill) => skill.name), ["from-a", "from-b"]);
+	});
+
+	it("honors Pi ignore files for directory-valued package-manifest globs", () => {
+		const packageRoot = path.join(tempDir, ".pi", "packages", "ignored-glob");
+		const bundleRoot = path.join(packageRoot, "skills", "bundle");
+		writePackageManifest(packageRoot, ["skills/*"]);
+		makeManifestSkill(packageRoot, "skills/bundle", "visible", "Visible skill.");
+		makeManifestSkill(packageRoot, "skills/bundle", "git-ignored", "Ignored by .gitignore.");
+		makeManifestSkill(packageRoot, "skills/bundle/ignored", "hidden", "Ignored before negation.");
+		makeManifestSkill(packageRoot, "skills/bundle/ignored", "reincluded", "Restored by negation.");
+		makeManifestSkill(packageRoot, "skills/bundle/nested", "ignored-by-ignore", "Ignored by nested .ignore.");
+		makeManifestSkill(packageRoot, "skills/bundle/nested", "ignored-by-fdignore", "Ignored by nested .fdignore.");
+		makeManifestSkill(packageRoot, "skills/bundle", ".hidden", "Hidden traversal entry.");
+		makeManifestSkill(packageRoot, "skills/bundle/node_modules", "node-package", "node_modules traversal entry.");
+		fs.writeFileSync(
+			path.join(bundleRoot, ".gitignore"),
+			"git-ignored/\nignored/*\n!ignored/reincluded/\n",
+			"utf-8",
+		);
+		fs.mkdirSync(path.join(bundleRoot, "nested"), { recursive: true });
+		fs.writeFileSync(path.join(bundleRoot, "nested", ".ignore"), "ignored-by-ignore/\n", "utf-8");
+		fs.writeFileSync(path.join(bundleRoot, "nested", ".fdignore"), "ignored-by-fdignore/\n", "utf-8");
+		fs.mkdirSync(path.join(tempDir, ".pi"), { recursive: true });
+		fs.writeFileSync(
+			path.join(tempDir, ".pi", "settings.json"),
+			JSON.stringify({ packages: ["./packages/ignored-glob"] }, null, 2),
+			"utf-8",
+		);
+
+		const { resolved, missing } = resolveSkills(
+			["visible", "git-ignored", "hidden", "reincluded", "ignored-by-ignore", "ignored-by-fdignore", ".hidden", "node-package"],
+			tempDir,
+		);
+		assert.deepEqual(resolved.map((skill) => skill.name), ["visible", "reincluded"]);
+		assert.deepEqual(missing, ["git-ignored", "hidden", "ignored-by-ignore", "ignored-by-fdignore", ".hidden", "node-package"]);
+	});
+
+	it("keeps project-local skills ahead of glob-backed package skills", () => {
+		const packageRoot = path.join(tempDir, ".pi", "packages", "glob-package");
+		writePackageManifest(packageRoot, ["skills/*/SKILL.md"]);
+		makeManifestSkill(packageRoot, "skills", "shared-skill", "Package version.");
+		makeManifestSkill(packageRoot, "skills", "package-sentinel", "Package-only version.");
+		makeProjectSkill(tempDir, "shared-skill", "Project version.");
+		fs.mkdirSync(path.join(tempDir, ".pi"), { recursive: true });
+		fs.writeFileSync(
+			path.join(tempDir, ".pi", "settings.json"),
+			JSON.stringify({ packages: ["./packages/glob-package"] }, null, 2),
+			"utf-8",
+		);
+
+		const { resolved, missing } = resolveSkills(["shared-skill", "package-sentinel"], tempDir);
+		assert.deepEqual(missing, []);
+		assert.equal(resolved[0]?.source, "project");
+		assert.match(resolved[0]?.content ?? "", /Project version\./);
+		assert.equal(resolved[1]?.source, "project-package");
+		assert.match(resolved[1]?.content ?? "", /Package-only version\./);
+	});
+
 	it("discovers skills from the current cwd package", () => {
 		makePackageSkill(tempDir, "cwd-package-skill", "Cwd package skill.");
 
@@ -527,6 +812,18 @@ describe("skills filesystem fallback", () => {
 			() => resolveSkills(["missing-skill"], tempDir),
 			/Failed to read skills settings file .+\.pi[\\/]settings\.json/,
 		);
+	});
+
+	it("ignores malformed installed-package siblings during best-effort package scans", () => {
+		const packagesRoot = path.join(tempDir, ".pi", "npm", "node_modules");
+		const brokenRoot = path.join(packagesRoot, "broken-package");
+		fs.mkdirSync(brokenRoot, { recursive: true });
+		fs.writeFileSync(path.join(brokenRoot, "package.json"), "{bad-json", "utf-8");
+		makePackageSkill(path.join(packagesRoot, "valid-package"), "installed-sibling-skill", "Installed sibling skill.");
+
+		const { resolved, missing } = resolveSkills(["installed-sibling-skill"], tempDir);
+		assert.deepEqual(missing, []);
+		assert.equal(resolved[0]?.source, "project-package");
 	});
 
 	it("surfaces malformed explicit settings package manifests instead of silently ignoring them", () => {
