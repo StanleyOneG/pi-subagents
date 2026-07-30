@@ -7,7 +7,8 @@ import { resolveMcpDirectToolSelections, type ResolvedMcpDirectToolSelection } f
 import { resolvePiPackageRoot } from "./pi-spawn.ts";
 import { STRUCTURED_OUTPUT_CAPTURE_ENV, STRUCTURED_OUTPUT_SCHEMA_ENV } from "./structured-output.ts";
 import { TEMP_ROOT_DIR, type JsonSchemaObject, type ResolvedToolBudget } from "../../shared/types.ts";
-import { THINKING_LEVELS } from "../../shared/model-info.ts";
+import { applyThinkingSuffix } from "../../shared/model-info.ts";
+export { applyThinkingSuffix } from "../../shared/model-info.ts";
 import { TOOL_BUDGET_ENV, TOOL_BUDGET_ZERO_AUTH_ENV, encodeToolBudgetEnv } from "./tool-budget.ts";
 import { CHILD_TOOL_DIAGNOSTIC_PATH_ENV, MCP_DIRECT_CHILD_TOOLS_ENV, REQUIRED_CHILD_TOOLS_ENV } from "./tool-availability.ts";
 import { CHILD_WATCHDOG_CONFIG_ENV, encodeChildWatchdogConfig, type ChildWatchdogConfig } from "../../watchdog/child-status.ts";
@@ -103,15 +104,6 @@ function sanitizeSupervisorChannelSegment(value: string): string {
 
 function supervisorChannelDir(runId: string, agent: string, childIndex: number): string {
 	return path.join(TEMP_ROOT_DIR, "supervisor-channels", `${sanitizeSupervisorChannelSegment(runId)}-${sanitizeSupervisorChannelSegment(agent)}-${childIndex}`);
-}
-
-export function applyThinkingSuffix(model: string | undefined, thinking: string | false | undefined, replaceExisting = false): string | undefined {
-	if (!model || !thinking) return model;
-	const colonIdx = model.lastIndexOf(":");
-	if (colonIdx !== -1 && THINKING_LEVELS.some((level) => level === model.substring(colonIdx + 1))) {
-		return replaceExisting ? `${model.slice(0, colonIdx)}:${thinking}` : model;
-	}
-	return `${model}:${thinking}`;
 }
 
 export interface ResolvePiLaunchToolPlanInput {

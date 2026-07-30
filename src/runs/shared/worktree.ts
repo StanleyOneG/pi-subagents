@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { writeArtifact } from "../../shared/artifacts.ts";
 
 export interface WorktreeSetup {
 	cwd: string;
@@ -488,7 +489,7 @@ function captureWorktreeDiff(
 	const diffStat = runGitChecked(worktree.path, ["diff", "--cached", "--stat", setup.baseCommit]).trim();
 	const patch = runGitChecked(worktree.path, ["diff", "--cached", setup.baseCommit]);
 	const numstat = runGitChecked(worktree.path, ["diff", "--cached", "--numstat", setup.baseCommit]);
-	fs.writeFileSync(patchPath, patch, "utf-8");
+	writeArtifact(patchPath, patch);
 
 	if (!patch.trim()) {
 		return emptyDiff(worktree.index, agent, worktree.branch, patchPath);
@@ -509,7 +510,7 @@ function captureWorktreeDiff(
 
 function writeEmptyPatch(patchPath: string): void {
 	try {
-		fs.writeFileSync(patchPath, "", "utf-8");
+		writeArtifact(patchPath, "");
 	} catch {
 		// Diff artifact writing is best-effort in error paths.
 	}

@@ -276,6 +276,41 @@ describe("profiles helpers", () => {
 		]);
 	});
 
+	it("checks max profile entries against model metadata before probing", async () => {
+		const profilesDir = getSubagentProfilesDir();
+		fs.mkdirSync(profilesDir, { recursive: true });
+		fs.writeFileSync(path.join(profilesDir, "max.json"), JSON.stringify({
+			subagents: {
+				agentOverrides: {
+					scout: { model: "test/metadata-max", thinking: "max" },
+					worker: { model: "test/legacy:max" },
+					writer: { model: "test/legacy", thinking: "max" },
+					orphan: { thinking: "max" },
+				},
+			},
+		}, null, 2));
+		const probedModels: unknown[] = [];
+		const pi = {
+			exec: async (_command: string, args: string[]) => {
+				probedModels.push(args[2]);
+				return { stdout: "OK\n", stderr: "", code: 0, killed: false };
+			},
+		};
+		const ctx = makeCtx(process.cwd(), [
+			{ provider: "test", id: "metadata-max", thinkingLevelMap: { max: "max" } },
+			{ provider: "test", id: "legacy" },
+		]);
+		const result = await checkSubagentProfile(pi, ctx as never, "max");
+
+		assert.deepEqual(probedModels, ["test/metadata-max:max"]);
+		assert.deepEqual(result.results, [
+			{ agent: "scout", model: "test/metadata-max", inRegistry: true, probe: { status: "ok", message: "OK" } },
+			{ agent: "worker", model: "test/legacy:max", inRegistry: true, probe: { status: "unavailable", message: "Profile 'max' model 'test/legacy' does not support thinking 'max'; Pi model metadata must advertise thinkingLevelMap.max." } },
+			{ agent: "writer", model: "test/legacy", inRegistry: true, probe: { status: "unavailable", message: "Profile 'max' model 'test/legacy' does not support thinking 'max'; Pi model metadata must advertise thinkingLevelMap.max." } },
+			{ agent: "orphan", model: "(inherit)", inRegistry: false, probe: { status: "unavailable", message: "Profile 'max' override 'orphan' configures thinking 'max' without a resolvable explicit max-capable model." } },
+		]);
+	});
+
 	it("checks short model ids and thinking suffixes against the registry", async () => {
 		const profilesDir = getSubagentProfilesDir();
 		fs.mkdirSync(profilesDir, { recursive: true });

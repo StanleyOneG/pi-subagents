@@ -26,6 +26,7 @@ export type AgentScope = "user" | "project" | "both";
 export type AgentSource = "builtin" | "package" | "user" | "project";
 type SystemPromptMode = "append" | "replace";
 export type AgentDefaultContext = "fresh" | "fork";
+export type AgentAcceptanceCapability = "read-only" | "mutating";
 
 export type AgentMemoryScope = "project" | "user";
 
@@ -67,11 +68,15 @@ export interface BuiltinAgentOverrideBase {
 	inheritSkills: boolean;
 	defaultContext?: AgentDefaultContext;
 	acceptanceRole?: AcceptanceRole;
+	acceptanceCapability?: AgentAcceptanceCapability;
 	disabled?: boolean;
 	systemPrompt: string;
 	skills?: string[];
+	optionalSkills?: string[];
+	requiredSkills?: string[];
 	skillPath?: string[];
 	tools?: string[];
+	requiredTools?: string[];
 	mcpDirectTools?: string[];
 	extensions?: string[];
 	subagentOnlyExtensions?: string[];
@@ -88,10 +93,14 @@ interface BuiltinAgentOverrideConfig {
 	inheritSkills?: boolean;
 	defaultContext?: AgentDefaultContext | false;
 	acceptanceRole?: AcceptanceRole | false;
+	acceptanceCapability?: AgentAcceptanceCapability | false;
 	disabled?: boolean;
 	systemPrompt?: string;
 	skills?: string[] | false;
+	optionalSkills?: string[] | false;
+	requiredSkills?: string[] | false;
 	tools?: string[] | false;
+	requiredTools?: string[] | false;
 	extensions?: string[] | false;
 	subagentOnlyExtensions?: string[] | false;
 	completionGuard?: boolean;
@@ -130,11 +139,16 @@ export interface AgentConfig {
 	defaultTurnBudget?: TurnBudgetConfig;
 	defaultAcceptance?: AcceptanceInput;
 	acceptanceRole?: AcceptanceRole;
+	/** Stan-compatible capability alias; mapped to acceptanceRole for upstream inference. */
+	acceptanceCapability?: AgentAcceptanceCapability;
 	systemPrompt: string;
 	source: AgentSource;
 	filePath: string;
 	skills?: string[];
+	optionalSkills?: string[];
+	requiredSkills?: string[];
 	skillPath?: string[];
+	requiredTools?: string[];
 	extensions?: string[];
 	extensionsFromDefault?: boolean;
 	subagentOnlyExtensions?: string[];
@@ -515,11 +529,15 @@ function cloneOverrideBase(agent: AgentConfig): BuiltinAgentOverrideBase {
 		inheritSkills: agent.inheritSkills,
 		defaultContext: agent.defaultContext,
 		acceptanceRole: agent.acceptanceRole,
+		acceptanceCapability: agent.acceptanceCapability,
 		disabled: agent.disabled,
 		systemPrompt: agent.systemPrompt,
 		skills: agent.skills ? [...agent.skills] : undefined,
+		optionalSkills: agent.optionalSkills ? [...agent.optionalSkills] : undefined,
+		requiredSkills: agent.requiredSkills ? [...agent.requiredSkills] : undefined,
 		skillPath: agent.skillPath ? [...agent.skillPath] : undefined,
 		tools: agent.tools ? [...agent.tools] : undefined,
+		requiredTools: agent.requiredTools ? [...agent.requiredTools] : undefined,
 		mcpDirectTools: agent.mcpDirectTools ? [...agent.mcpDirectTools] : undefined,
 		extensions: agent.extensionsFromDefault ? undefined : agent.extensions ? [...agent.extensions] : undefined,
 		subagentOnlyExtensions: agent.subagentOnlyExtensions ? [...agent.subagentOnlyExtensions] : undefined,
@@ -540,10 +558,14 @@ function cloneOverrideValue(override: BuiltinAgentOverrideConfig): BuiltinAgentO
 		...(override.inheritSkills !== undefined ? { inheritSkills: override.inheritSkills } : {}),
 		...(override.defaultContext !== undefined ? { defaultContext: override.defaultContext } : {}),
 		...(override.acceptanceRole !== undefined ? { acceptanceRole: override.acceptanceRole } : {}),
+		...(override.acceptanceCapability !== undefined ? { acceptanceCapability: override.acceptanceCapability } : {}),
 		...(override.disabled !== undefined ? { disabled: override.disabled } : {}),
 		...(override.systemPrompt !== undefined ? { systemPrompt: override.systemPrompt } : {}),
 		...(override.skills !== undefined ? { skills: override.skills === false ? false : [...override.skills] } : {}),
+		...(override.optionalSkills !== undefined ? { optionalSkills: override.optionalSkills === false ? false : [...override.optionalSkills] } : {}),
+		...(override.requiredSkills !== undefined ? { requiredSkills: override.requiredSkills === false ? false : [...override.requiredSkills] } : {}),
 		...(override.tools !== undefined ? { tools: override.tools === false ? false : [...override.tools] } : {}),
+		...(override.requiredTools !== undefined ? { requiredTools: override.requiredTools === false ? false : [...override.requiredTools] } : {}),
 		...(override.extensions !== undefined ? { extensions: override.extensions === false ? false : [...override.extensions] } : {}),
 		...(override.subagentOnlyExtensions !== undefined ? { subagentOnlyExtensions: override.subagentOnlyExtensions === false ? false : [...override.subagentOnlyExtensions] } : {}),
 		...(override.completionGuard !== undefined ? { completionGuard: override.completionGuard } : {}),
@@ -684,6 +706,17 @@ function parseBuiltinOverrideEntry(
 		}
 	}
 
+	if ("acceptanceCapability" in input) {
+		if (input.acceptanceCapability === "read-only" || input.acceptanceCapability === "mutating" || input.acceptanceCapability === false) {
+			override.acceptanceCapability = input.acceptanceCapability;
+		} else {
+			throw new Error(`Builtin override '${name}' in '${filePath}' has invalid 'acceptanceCapability'; expected 'read-only', 'mutating', or false.`);
+		}
+	}
+	if (override.acceptanceCapability && override.acceptanceRole && override.acceptanceRole !== (override.acceptanceCapability === "read-only" ? "read-only" : "writer")) {
+		throw new Error(`Builtin override '${name}' in '${filePath}' has conflicting 'acceptanceCapability' and 'acceptanceRole'.`);
+	}
+
 	if ("disabled" in input) {
 		if (typeof input.disabled === "boolean") {
 			override.disabled = input.disabled;
@@ -720,9 +753,15 @@ function parseBuiltinOverrideEntry(
 
 	const skills = parseOverrideStringArrayOrFalse(input.skills, { filePath, name, field: "skills" });
 	if (skills !== undefined) override.skills = skills;
+	const optionalSkills = parseOverrideStringArrayOrFalse(input.optionalSkills, { filePath, name, field: "optionalSkills" });
+	if (optionalSkills !== undefined) override.optionalSkills = optionalSkills;
+	const requiredSkills = parseOverrideStringArrayOrFalse(input.requiredSkills, { filePath, name, field: "requiredSkills" });
+	if (requiredSkills !== undefined) override.requiredSkills = requiredSkills;
 
 	const tools = parseOverrideStringArrayOrFalse(input.tools, { filePath, name, field: "tools" });
 	if (tools !== undefined) override.tools = tools;
+	const requiredTools = parseOverrideStringArrayOrFalse(input.requiredTools, { filePath, name, field: "requiredTools" });
+	if (requiredTools !== undefined) override.requiredTools = requiredTools;
 
 	const extensions = parseOverrideStringArrayOrFalse(input.extensions, { filePath, name, field: "extensions" });
 	if (extensions !== undefined) override.extensions = extensions;
@@ -891,14 +930,21 @@ function applyBuiltinOverride(
 	if (override.inheritSkills !== undefined) next.inheritSkills = override.inheritSkills;
 	if (override.defaultContext !== undefined) next.defaultContext = override.defaultContext === false ? undefined : override.defaultContext;
 	if (override.acceptanceRole !== undefined) next.acceptanceRole = override.acceptanceRole === false ? undefined : override.acceptanceRole;
+	if (override.acceptanceCapability !== undefined) {
+		next.acceptanceCapability = override.acceptanceCapability === false ? undefined : override.acceptanceCapability;
+		if (next.acceptanceCapability) next.acceptanceRole = next.acceptanceCapability === "read-only" ? "read-only" : "writer";
+	}
 	if (override.disabled !== undefined) next.disabled = override.disabled;
 	if (override.systemPrompt !== undefined) next.systemPrompt = override.systemPrompt;
 	if (override.skills !== undefined) next.skills = override.skills === false ? undefined : [...override.skills];
+	if (override.optionalSkills !== undefined) next.optionalSkills = override.optionalSkills === false ? undefined : [...override.optionalSkills];
+	if (override.requiredSkills !== undefined) next.requiredSkills = override.requiredSkills === false ? undefined : [...override.requiredSkills];
 	if (override.tools !== undefined) {
 		const { tools, mcpDirectTools } = splitToolList(override.tools === false ? [] : override.tools);
 		next.tools = tools;
 		next.mcpDirectTools = mcpDirectTools;
 	}
+	if (override.requiredTools !== undefined) next.requiredTools = override.requiredTools === false ? undefined : [...override.requiredTools];
 	if (override.extensions !== undefined) next.extensions = override.extensions === false ? undefined : [...override.extensions];
 	if (override.subagentOnlyExtensions !== undefined) {
 		next.subagentOnlyExtensions = override.subagentOnlyExtensions === false ? undefined : [...override.subagentOnlyExtensions];
@@ -906,6 +952,13 @@ function applyBuiltinOverride(
 	if (override.completionGuard !== undefined) next.completionGuard = override.completionGuard;
 	if (override.toolBudget !== undefined) next.toolBudget = override.toolBudget === false ? undefined : override.toolBudget;
 
+	if (next.acceptanceCapability) {
+		const mappedRole: AcceptanceRole = next.acceptanceCapability === "read-only" ? "read-only" : "writer";
+		if (next.acceptanceRole !== undefined && next.acceptanceRole !== mappedRole) {
+			throw new Error(`Builtin override for '${agent.name}' in '${meta.path}' conflicts with the effective acceptanceCapability '${next.acceptanceCapability}'.`);
+		}
+		next.acceptanceRole = mappedRole;
+	}
 	return next;
 }
 
@@ -1029,6 +1082,14 @@ function applyCustomAgentOverride(
 	if (override.acceptanceRole !== undefined) {
 		fill("acceptanceRole", ["acceptanceRole"], override.acceptanceRole === false ? undefined : override.acceptanceRole);
 	}
+	if (override.acceptanceCapability !== undefined) {
+		const hasCapabilityFrontmatter = agentHasFrontmatterField(agent, "acceptanceCapability");
+		fill("acceptanceCapability", ["acceptanceCapability"], override.acceptanceCapability === false ? undefined : override.acceptanceCapability);
+		if (!hasCapabilityFrontmatter && override.acceptanceCapability && !agentHasFrontmatterField(agent, "acceptanceRole")) {
+			mutable().acceptanceRole = override.acceptanceCapability === "read-only" ? "read-only" : "writer";
+			anyFilled = true;
+		}
+	}
 	if (override.disabled !== undefined && agent.disabled === undefined) {
 		mutable().disabled = override.disabled;
 		anyFilled = true;
@@ -1036,12 +1097,21 @@ function applyCustomAgentOverride(
 	if (override.skills !== undefined) {
 		fill("skills", ["skill", "skills"], override.skills === false ? undefined : [...override.skills]);
 	}
+	if (override.optionalSkills !== undefined) {
+		fill("optionalSkills", ["optionalSkills"], override.optionalSkills === false ? undefined : [...override.optionalSkills]);
+	}
+	if (override.requiredSkills !== undefined) {
+		fill("requiredSkills", ["requiredSkills"], override.requiredSkills === false ? undefined : [...override.requiredSkills]);
+	}
 	if (override.tools !== undefined && !agentHasFrontmatterField(agent, "tools")) {
 		const { tools, mcpDirectTools } = splitToolList(override.tools === false ? [] : override.tools);
 		const target = mutable();
 		target.tools = tools;
 		target.mcpDirectTools = mcpDirectTools;
 		anyFilled = true;
+	}
+	if (override.requiredTools !== undefined) {
+		fill("requiredTools", ["requiredTools"], override.requiredTools === false ? undefined : [...override.requiredTools]);
 	}
 	if (override.extensions !== undefined) {
 		fill("extensions", ["extensions"], override.extensions === false ? undefined : [...override.extensions]);
@@ -1061,6 +1131,13 @@ function applyCustomAgentOverride(
 	}
 
 	if (!anyFilled || !next) return agent;
+	if (next.acceptanceCapability) {
+		const mappedRole: AcceptanceRole = next.acceptanceCapability === "read-only" ? "read-only" : "writer";
+		if (next.acceptanceRole !== undefined && next.acceptanceRole !== mappedRole) {
+			throw new Error(`Custom agent override for '${agent.name}' in '${meta.path}' conflicts with the effective acceptanceCapability '${next.acceptanceCapability}'.`);
+		}
+		next.acceptanceRole = mappedRole;
+	}
 	next.override = { ...meta, base: cloneOverrideBase(agent) };
 	const frontmatterFields = agentFrontmatterFields.get(agent);
 	if (frontmatterFields) agentFrontmatterFields.set(next, frontmatterFields);
@@ -1091,7 +1168,7 @@ function applyCustomAgentOverrides(
 
 export function buildBuiltinOverrideConfig(
 	base: BuiltinAgentOverrideBase,
-	draft: Pick<AgentConfig, "model" | "fallbackModels" | "thinking" | "systemPromptMode" | "inheritProjectContext" | "inheritSkills" | "defaultContext" | "acceptanceRole" | "disabled" | "systemPrompt" | "skills" | "tools" | "mcpDirectTools" | "extensions" | "subagentOnlyExtensions" | "completionGuard" | "toolBudget">,
+	draft: Pick<AgentConfig, "model" | "fallbackModels" | "thinking" | "systemPromptMode" | "inheritProjectContext" | "inheritSkills" | "defaultContext" | "acceptanceRole" | "acceptanceCapability" | "disabled" | "systemPrompt" | "skills" | "optionalSkills" | "requiredSkills" | "tools" | "requiredTools" | "mcpDirectTools" | "extensions" | "subagentOnlyExtensions" | "completionGuard" | "toolBudget">,
 ): BuiltinAgentOverrideConfig | undefined {
 	const override: BuiltinAgentOverrideConfig = {};
 
@@ -1103,13 +1180,17 @@ export function buildBuiltinOverrideConfig(
 	if (draft.inheritSkills !== base.inheritSkills) override.inheritSkills = draft.inheritSkills;
 	if (draft.defaultContext !== base.defaultContext) override.defaultContext = draft.defaultContext ?? false;
 	if (draft.acceptanceRole !== base.acceptanceRole) override.acceptanceRole = draft.acceptanceRole ?? false;
+	if (draft.acceptanceCapability !== base.acceptanceCapability) override.acceptanceCapability = draft.acceptanceCapability ?? false;
 	if (draft.disabled !== base.disabled) override.disabled = draft.disabled ?? false;
 	if (draft.systemPrompt !== base.systemPrompt) override.systemPrompt = draft.systemPrompt;
 	if (!arraysEqual(draft.skills, base.skills)) override.skills = draft.skills ? [...draft.skills] : false;
+	if (!arraysEqual(draft.optionalSkills, base.optionalSkills)) override.optionalSkills = draft.optionalSkills ? [...draft.optionalSkills] : false;
+	if (!arraysEqual(draft.requiredSkills, base.requiredSkills)) override.requiredSkills = draft.requiredSkills ? [...draft.requiredSkills] : false;
 
 	const baseTools = joinToolList(base);
 	const draftTools = joinToolList(draft);
 	if (!arraysEqual(draftTools, baseTools)) override.tools = draftTools ? [...draftTools] : false;
+	if (!arraysEqual(draft.requiredTools, base.requiredTools)) override.requiredTools = draft.requiredTools ? [...draft.requiredTools] : false;
 	if (!arraysEqual(draft.extensions, base.extensions)) override.extensions = draft.extensions ? [...draft.extensions] : false;
 	if (!arraysEqual(draft.subagentOnlyExtensions, base.subagentOnlyExtensions)) {
 		override.subagentOnlyExtensions = draft.subagentOnlyExtensions ? [...draft.subagentOnlyExtensions] : false;
@@ -1337,6 +1418,9 @@ function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 		const defaultReads = parseFrontmatterList(frontmatter.defaultReads);
 		const skillStr = frontmatter.skill || frontmatter.skills;
 		const skills = parseFrontmatterList(skillStr);
+		const optionalSkills = parseFrontmatterList(frontmatter.optionalSkills);
+		const requiredSkills = parseFrontmatterList(frontmatter.requiredSkills);
+		const requiredTools = parseFrontmatterList(frontmatter.requiredTools);
 		const skillPath = parseFrontmatterList(frontmatter.skillPath);
 		const fallbackModels = parseFrontmatterList(frontmatter.fallbackModels);
 		const systemPromptMode = frontmatter.systemPromptMode === "replace"
@@ -1386,6 +1470,16 @@ function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 			if (frontmatter.acceptanceRole === "read-only" || frontmatter.acceptanceRole === "writer") acceptanceRole = frontmatter.acceptanceRole;
 			else throw new Error(`Agent '${localName}' has invalid acceptanceRole frontmatter; expected 'read-only' or 'writer'.`);
 		}
+		let acceptanceCapability: AgentAcceptanceCapability | undefined;
+		if (frontmatter.acceptanceCapability !== undefined && frontmatter.acceptanceCapability.trim()) {
+			if (frontmatter.acceptanceCapability === "read-only" || frontmatter.acceptanceCapability === "mutating") acceptanceCapability = frontmatter.acceptanceCapability;
+			else throw new Error(`Agent '${localName}' has invalid acceptanceCapability frontmatter; expected 'read-only' or 'mutating'.`);
+			const mappedRole: AcceptanceRole = acceptanceCapability === "read-only" ? "read-only" : "writer";
+			if (acceptanceRole !== undefined && acceptanceRole !== mappedRole) {
+				throw new Error(`Agent '${localName}' acceptanceCapability '${acceptanceCapability}' conflicts with acceptanceRole '${acceptanceRole}'.`);
+			}
+			acceptanceRole = mappedRole;
+		}
 
 		const extensions = parseFrontmatterList(frontmatter.extensions);
 		const subagentOnlyExtensions = parseFrontmatterList(frontmatter.subagentOnlyExtensions);
@@ -1429,10 +1523,14 @@ function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 			defaultTurnBudget,
 			defaultAcceptance,
 			acceptanceRole,
+			acceptanceCapability,
 			systemPrompt: body,
 			source,
 			filePath,
 			skills: skills && skills.length > 0 ? skills : undefined,
+			optionalSkills: optionalSkills && optionalSkills.length > 0 ? optionalSkills : undefined,
+			requiredSkills: requiredSkills && requiredSkills.length > 0 ? requiredSkills : undefined,
+			requiredTools: requiredTools && requiredTools.length > 0 ? requiredTools : undefined,
 			skillPath: skillPath && skillPath.length > 0 ? skillPath : undefined,
 			extensions,
 			subagentOnlyExtensions,

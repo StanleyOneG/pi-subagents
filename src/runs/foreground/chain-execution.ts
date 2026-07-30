@@ -106,7 +106,9 @@ interface ParallelChainRunInput {
 	agents: AgentConfig[];
 	stepIndex: number;
 	availableModels: ModelInfo[];
+	availableToolNames?: string[];
 	modelScope?: ModelScopeConfig;
+	chainSkills: string[];
 	chainDir: string;
 	prev: string;
 	originalTask: string;
@@ -243,6 +245,18 @@ function finalizeParallelWorktreeHandoff(input: {
 	}
 }
 
+function resolveChainResourceSkillPreflight(
+	step: SequentialStep,
+	chainSkills: string[],
+): { skills: string[]; useAgentSkills: boolean } {
+	const stepSelection = normalizeSkillInput(step.skill);
+	if (stepSelection === false) return { skills: [], useAgentSkills: false };
+	if (stepSelection !== undefined) {
+		return { skills: [...new Set([...stepSelection, ...chainSkills])], useAgentSkills: false };
+	}
+	return { skills: [...chainSkills], useAgentSkills: true };
+}
+
 function resolveChainToolBudget(input: { stepBudget?: ToolBudgetConfig; runBudget?: ResolvedToolBudget; agentBudget?: ToolBudgetConfig; configBudget?: ToolBudgetConfig }): { toolBudget?: ResolvedToolBudget; error?: string } {
 	if (input.stepBudget !== undefined) {
 		const resolved = validateToolBudgetConfig(input.stepBudget, "toolBudget");
@@ -342,6 +356,7 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 				? createStructuredOutputRuntime(task.outputSchema, path.join(input.chainDir, "structured-output"))
 				: undefined;
 			const agentContract = task.agentContract ?? input.step.agentContract ?? input.agentContract;
+			const resourceSkillPreflight = resolveChainResourceSkillPreflight(task, input.chainSkills);
 			const result = await runSync(input.ctx.cwd, input.agents, task.agent, taskStr, {
 				parentSessionId: input.ctx.sessionManager.getSessionId() ?? undefined,
 				capabilityCeiling: input.capabilityCeiling,
@@ -361,6 +376,7 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 				artifactsDir: input.artifactConfig.enabled ? input.artifactsDir : undefined,
 				artifactConfig: input.artifactConfig,
 				outputPath,
+				outputPrivateRoot: input.chainDir,
 				outputMode: behavior.outputMode,
 				maxSubagentDepth,
 				controlConfig: input.controlConfig,
@@ -370,9 +386,12 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 				nestedRoute: input.nestedRoute,
 				modelOverride: effectiveModel,
 				availableModels: input.availableModels,
+				...(input.availableToolNames !== undefined ? { availableToolNames: input.availableToolNames } : {}),
 				preferredModelProvider: input.ctx.model?.provider,
 				modelScope: input.modelScope,
 				skills: behavior.skills === false ? [] : behavior.skills,
+				resourcePreflightSkills: resourceSkillPreflight.skills,
+				resourcePreflightUseAgentSkills: resourceSkillPreflight.useAgentSkills,
 				structuredOutput: structuredRuntime,
 				agentContract,
 				acceptance: task.acceptance,
@@ -447,6 +466,7 @@ interface ChainExecutionParams {
 	thinkingOverrideForTask?: (agentName: string, idx?: number, modelOverride?: string) => AgentConfig["thinking"] | undefined;
 	contextForAgent?: (agentName: string) => ContextMode;
 	modelScope?: ModelScopeConfig;
+	availableToolNames?: string[];
 	artifactsDir: string;
 	artifactConfig: ArtifactConfig;
 	includeProgress?: boolean;
@@ -729,7 +749,9 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 					agents,
 					stepIndex,
 					availableModels,
+					availableToolNames: params.availableToolNames,
 					modelScope,
+					chainSkills,
 					chainDir,
 					prev,
 					originalTask,
@@ -927,6 +949,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 						explicit: step.acceptance,
 						agentName: step.parallel.agent,
 						acceptanceRole: agents.find((agent) => agent.name === step.parallel.agent)?.acceptanceRole,
+						acceptanceCapability: agents.find((agent) => agent.name === step.parallel.agent)?.acceptanceCapability,
 						task: (step.parallel.task ?? originalTask ?? "").replace(/\{task\}/g, originalTask ?? ""),
 						mode: "chain",
 						dynamicGroup: true,
@@ -986,7 +1009,9 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				agents,
 				stepIndex,
 				availableModels,
+				availableToolNames: params.availableToolNames,
 				modelScope,
+				chainSkills,
 				chainDir,
 				prev,
 				originalTask,
@@ -1116,6 +1141,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				explicit: step.acceptance,
 				agentName: step.parallel.agent,
 				acceptanceRole: agents.find((agent) => agent.name === step.parallel.agent)?.acceptanceRole,
+				acceptanceCapability: agents.find((agent) => agent.name === step.parallel.agent)?.acceptanceCapability,
 				task: materialized.parallel
 					.map((task) => (task.task ?? originalTask ?? "").replace(/\{task\}/g, originalTask ?? ""))
 					.join("\n"),
@@ -1131,10 +1157,11 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 					notes: `Dynamic fanout collected ${collected.length} result(s) into ${step.collect.as}.`,
 				}),
 				cwd: cwd ?? ctx.cwd,
+				observedMutationAttempt: parallelResults.some((result) => result.observedMutationAttempt === true),
 				reportOptional: isAgentContractV1(step.agentContract ?? params.agentContract),
 			});
 			dynamicGroupStatuses[stepIndex].acceptance = groupAcceptance;
-			const groupAcceptanceFailure = effectiveGroupAcceptance.explicit && (!isAgentContractV1(step.agentContract ?? params.agentContract) || step.gateOn === "acceptance") ? acceptanceFailureMessage(groupAcceptance) : undefined;
+			const groupAcceptanceFailure = (effectiveGroupAcceptance.explicit || effectiveGroupAcceptance.context.capability === "read-only") && (!isAgentContractV1(step.agentContract ?? params.agentContract) || step.gateOn === "acceptance") ? acceptanceFailureMessage(groupAcceptance) : undefined;
 			if (groupAcceptanceFailure) {
 				dynamicGroupStatuses[stepIndex] = { status: "failed", error: groupAcceptanceFailure, acceptance: groupAcceptance };
 				return buildChainExecutionErrorResult(groupAcceptanceFailure, makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex - dynamicParallelStep.parallel.length }));
@@ -1250,6 +1277,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				dynamicChildren,
 				dynamicGroupStatuses,
 			});
+			const resourceSkillPreflight = resolveChainResourceSkillPreflight(seqStep, chainSkills);
 			const r = await runSync(ctx.cwd, agents, seqStep.agent, stepTask, {
 				parentSessionId: ctx.sessionManager.getSessionId() ?? undefined,
 				capabilityCeiling: params.capabilityCeiling,
@@ -1269,6 +1297,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				artifactsDir: artifactConfig.enabled ? artifactsDir : undefined,
 				artifactConfig,
 				outputPath,
+				outputPrivateRoot: chainDir,
 				outputMode: behavior.outputMode,
 				maxSubagentDepth,
 				controlConfig,
@@ -1280,7 +1309,10 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				availableModels,
 				preferredModelProvider: ctx.model?.provider,
 				modelScope,
+				...(params.availableToolNames !== undefined ? { availableToolNames: params.availableToolNames } : {}),
 				skills: behavior.skills === false ? [] : behavior.skills,
+				resourcePreflightSkills: resourceSkillPreflight.skills,
+				resourcePreflightUseAgentSkills: resourceSkillPreflight.useAgentSkills,
 				structuredOutput: structuredRuntime,
 				agentContract,
 				acceptance: seqStep.acceptance,
@@ -1393,9 +1425,14 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 	}
 
 	const summary = buildChainSummary(chainSteps, results, chainDir, "completed");
+	const finalResult = results.at(-1);
+	const finalOutput = finalResult ? getSingleResultOutput(finalResult).trim() : "";
+	const renderedSummary = finalOutput
+		? `${summary}\n\nFinal result (${finalResult!.agent}):\n${finalOutput}`
+		: summary;
 
 	return {
-		content: [{ type: "text", text: summary }],
+		content: [{ type: "text", text: renderedSummary }],
 		details: buildChainExecutionDetails(makeDetailsInput()),
 	};
 }

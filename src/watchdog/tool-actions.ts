@@ -4,8 +4,8 @@ import { THINKING_LEVELS, type ThinkingLevel } from "../shared/model-info.ts";
 import type { Details } from "../shared/types.ts";
 import { buildWatchdogStatus } from "./register-main.ts";
 import type { MainWatchdogRuntime } from "./runtime.ts";
-import { parseWatchdogThinkingInput, recommendStrongWatchdogModel, resolveWatchdogModelInput } from "./model-selection.ts";
-import { writeWatchdogModelSettings, type WatchdogModelSettingsTarget, type WatchdogSettingsWriteScope } from "./settings.ts";
+import { assertWatchdogConfigurationSupported, assertWatchdogResolvedConfigurationSupported, parseWatchdogThinkingInput, recommendStrongWatchdogModel, resolveWatchdogModelInput } from "./model-selection.ts";
+import { readWatchdogPersistentTargetState, resolveWatchdogConfig, writeWatchdogModelSettings, type WatchdogModelSettingsTarget, type WatchdogSettingsWriteScope } from "./settings.ts";
 
 interface WatchdogToolParams {
 	action?: string;
@@ -52,28 +52,95 @@ function parseThinking(raw: string | false | undefined): ThinkingLevel | false |
 	return parseWatchdogThinkingInput(raw, "watchdog.configure thinking") ?? undefined;
 }
 
-function resolveConfiguredValue(ctx: ExtensionContext, params: WatchdogToolParams): { model?: string | null; thinking?: ThinkingLevel | false | null; description: string } {
+interface WatchdogTargetState {
+	model?: string;
+	thinking?: ThinkingLevel | false;
+	inheritedModel?: string;
+	inheritedThinking?: ThinkingLevel | false;
+	allowCurrentModel: boolean;
+}
+
+interface WatchdogModelPatch {
+	model?: string | null;
+	thinking?: ThinkingLevel | false | null;
+}
+
+function configuredTargetState(
+	runtime: MainWatchdogRuntime | undefined,
+	cwd: string,
+	target: WatchdogModelSettingsTarget,
+	scope: "session" | WatchdogSettingsWriteScope,
+): WatchdogTargetState {
+	if (scope !== "session") {
+		return { ...readWatchdogPersistentTargetState({ scope, cwd, target }), allowCurrentModel: false };
+	}
+	const config = runtime?.getSnapshot(cwd).config;
+	if (!config) throw new Error("Session-scoped watchdog.configure requires an active watchdog runtime.");
+	if (target.kind === "main") {
+		const persistent = resolveWatchdogConfig(cwd);
+		if (!persistent.ok) throw new Error(persistent.errors.map((error) => error.message).join("\n"));
+		return {
+			model: config.main.model,
+			thinking: config.main.thinking as ThinkingLevel | false | undefined,
+			inheritedModel: persistent.config.main.model,
+			inheritedThinking: persistent.config.main.thinking as ThinkingLevel | false | undefined,
+			allowCurrentModel: true,
+		};
+	}
+	if (target.kind === "children") return { model: config.children.model, thinking: config.children.thinking as ThinkingLevel | false | undefined, allowCurrentModel: false };
+	const override = config.children.overrides[target.agent];
+	return {
+		model: override?.model ?? config.children.model,
+		thinking: (override?.thinking ?? config.children.thinking) as ThinkingLevel | false | undefined,
+		inheritedModel: config.children.model,
+		inheritedThinking: config.children.thinking as ThinkingLevel | false | undefined,
+		allowCurrentModel: false,
+	};
+}
+
+function assertProspectiveTargetSupported(ctx: ExtensionContext, target: WatchdogTargetState, patch: WatchdogModelPatch, source: string): void {
+	const model = patch.model === null ? target.inheritedModel : patch.model ?? target.model;
+	const thinking = patch.thinking === null ? target.inheritedThinking : patch.thinking ?? target.thinking;
+	assertWatchdogConfigurationSupported(ctx, model, thinking, source, { allowCurrentModel: target.allowCurrentModel });
+}
+
+function resolveConfiguredValue(
+	ctx: ExtensionContext,
+	params: WatchdogToolParams,
+	target: WatchdogTargetState,
+): { model?: string | null; thinking?: ThinkingLevel | false | null; description: string } {
 	const thinking = parseThinking(params.thinking);
 	const rawModel = params.model?.trim();
 	if (!rawModel) {
 		if (thinking === undefined) throw new Error("watchdog.configure requires model, thinking, or both.");
-		return { thinking, description: `thinking ${thinking === null ? "inherit" : thinking === false ? "off" : thinking}` };
+		const value = { thinking, description: `thinking ${thinking === null ? "inherit" : thinking === false ? "off" : thinking}` };
+		assertProspectiveTargetSupported(ctx, target, value, "watchdog.configure thinking");
+		return value;
 	}
-	if (rawModel === "inherit") return { model: null, thinking: thinking ?? null, description: "inherit" };
+	if (rawModel === "inherit") {
+		const value = { model: null, thinking: thinking ?? null, description: "inherit" };
+		assertProspectiveTargetSupported(ctx, target, value, "watchdog.configure inherit");
+		return value;
+	}
 	if (rawModel === "recommended") {
 		const recommendation = recommendStrongWatchdogModel(ctx);
-		return {
+		const value = {
 			model: recommendation.model,
 			thinking: recommendation.thinking,
 			description: `${recommendation.model}:${recommendation.thinking}`,
 		};
+		assertProspectiveTargetSupported(ctx, target, value, "watchdog.configure recommended model");
+		return value;
 	}
 	const resolved = resolveWatchdogModelInput(ctx, rawModel);
-	return {
+	const effectiveThinking = resolved.thinking ?? thinking;
+	const value = {
 		model: resolved.model,
-		thinking: resolved.thinking ?? thinking,
-		description: `${resolved.model}${resolved.thinking ?? thinking ? `:${resolved.thinking ?? thinking}` : ""}`,
+		thinking: effectiveThinking,
+		description: `${resolved.model}${effectiveThinking ? `:${effectiveThinking}` : ""}`,
 	};
+	assertProspectiveTargetSupported(ctx, target, value, "watchdog.configure model");
+	return value;
 }
 
 function buildRecommendationText(ctx: ExtensionContext): string {
@@ -91,6 +158,7 @@ function buildCheckText(runtime: MainWatchdogRuntime | undefined, ctx: Extension
 	if (!runtime) return "Subagent watchdog runtime is unavailable.";
 	const snapshot = runtime.getSnapshot(ctx.cwd);
 	if (!snapshot.configOk) return ["Subagent watchdog config check", "Config errors:", ...snapshot.errors.map((error) => `- ${error.message}`)].join("\n");
+	assertWatchdogResolvedConfigurationSupported(ctx, snapshot.config, "watchdog.check");
 	const lines = ["Subagent watchdog config check", "Config: ok"];
 	if (snapshot.config.main.model) {
 		const resolved = resolveWatchdogModelInput(ctx, snapshot.config.main.model);
@@ -120,7 +188,7 @@ export function handleWatchdogToolAction(action: string, params: WatchdogToolPar
 
 		const scope = parseScope(params.scope);
 		const target = parseTarget(params);
-		const value = resolveConfiguredValue(ctx, params);
+		const value = resolveConfiguredValue(ctx, params, configuredTargetState(runtime, ctx.cwd, target, scope));
 		if (scope === "session") {
 			if (!runtime) return result("Subagent watchdog runtime is unavailable.", true);
 			if (target.kind !== "main") return result("Session-scoped watchdog.configure currently supports target='main' only.", true);

@@ -139,6 +139,26 @@ describe("dynamic fanout helpers", () => {
 		);
 	});
 
+	it("accepts runner-owned skill provenance and private output fields on dynamic templates", () => {
+		const runnerStep = {
+			expand: { from: { output: "targets", path: "/items" }, maxItems: 4 },
+			parallel: {
+				agent: "reviewer",
+				task: "Review {item.path}",
+				skillsWarning: "Optional skill missing",
+				resourceProvenance: [{ name: "review-plan", path: "/skills/review-plan/SKILL.md", source: "project", required: true }],
+				outputPrivateRoot: "/tmp/private-output",
+			},
+			collect: { as: "reviews" },
+		} as unknown as Parameters<typeof validateDynamicStepShape>[0];
+
+		assert.doesNotThrow(() => validateDynamicStepShape(runnerStep, 1, { allowRunnerFields: true }));
+		assert.throws(
+			() => validateDynamicStepShape(runnerStep, 1),
+			(error: unknown) => error instanceof DynamicFanoutError && /skillsWarning/.test(error.message),
+		);
+	});
+
 	it("accepts toolBudget on dynamic parallel templates", () => {
 		const step = {
 			expand: { from: { output: "targets", path: "/items" }, maxItems: 4 },

@@ -48,6 +48,13 @@ export interface WatchdogModelSettingsWrite {
 	thinking?: ThinkingLevel | false | null;
 }
 
+export interface WatchdogPersistentTargetState {
+	model?: string;
+	thinking?: ThinkingLevel | false;
+	inheritedModel?: string;
+	inheritedThinking?: ThinkingLevel | false;
+}
+
 type WatchdogConfigPatch = Partial<Omit<ResolvedWatchdogConfig, "guidance" | "autoFollow" | "main" | "children" | "asyncCompletion" | "lsp">> & {
 	guidance?: WatchdogGuidancePatch;
 	autoFollow?: WatchdogAutoFollowPatch;
@@ -454,6 +461,32 @@ function ensureWatchdogSettings(settings: Record<string, unknown>, meta: ParseMe
 
 function settingsPathForWrite(scope: WatchdogSettingsWriteScope, cwd: string | undefined): string {
 	return scope === "user" ? getUserSettingsPath() : getWatchdogProjectSettingsPath(cwd ?? process.cwd());
+}
+
+/** Resolve only the destination settings layer that a watchdog model write will mutate. */
+export function readWatchdogPersistentTargetState(input: Pick<WatchdogModelSettingsWrite, "scope" | "cwd" | "target">): WatchdogPersistentTargetState {
+	const settingsPath = settingsPathForWrite(input.scope, input.cwd);
+	const patch = parseSourceFile(settingsPath, input.scope);
+	if (input.target.kind === "main") {
+		return {
+			model: patch.main?.model,
+			thinking: patch.main?.thinking as ThinkingLevel | false | undefined,
+		};
+	}
+	if (input.target.kind === "children") {
+		return {
+			model: patch.children?.model,
+			thinking: patch.children?.thinking as ThinkingLevel | false | undefined,
+		};
+	}
+	const children = patch.children;
+	const override = children?.overrides?.[input.target.agent];
+	return {
+		model: override?.model ?? children?.model,
+		thinking: (override?.thinking ?? children?.thinking) as ThinkingLevel | false | undefined,
+		inheritedModel: children?.model,
+		inheritedThinking: children?.thinking as ThinkingLevel | false | undefined,
+	};
 }
 
 function targetSettingsObject(watchdog: Record<string, unknown>, target: WatchdogModelSettingsTarget, meta: ParseMeta): Record<string, unknown> {

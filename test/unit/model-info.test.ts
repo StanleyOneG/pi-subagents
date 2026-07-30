@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { findModelInfo, getSupportedThinkingLevels, splitKnownThinkingSuffix, toModelInfo, type ModelInfo } from "../../src/shared/model-info.ts";
+import { applyMetadataGatedThinkingSuffix, assertMaxThinkingSuffixSupported, findModelInfo, getSupportedThinkingLevels, splitKnownThinkingSuffix, toModelInfo, type ModelInfo } from "../../src/shared/model-info.ts";
 
 describe("model info helpers", () => {
 	const ambiguousModels: ModelInfo[] = [
@@ -62,6 +62,33 @@ describe("model info helpers", () => {
 				thinkingLevelMap: { off: null, minimal: null, low: null, medium: null, high: "high" },
 			}),
 			["high"],
+		);
+	});
+
+	it("rejects max without explicit model metadata and accepts advertised max", () => {
+		const supported: ModelInfo[] = [{
+			provider: "openai-codex",
+			id: "gpt-5.6",
+			fullId: "openai-codex/gpt-5.6",
+			reasoning: true,
+			thinkingLevelMap: { max: "max" },
+		}];
+		assert.equal(
+			applyMetadataGatedThinkingSuffix("openai-codex/gpt-5.6", "max", false, supported, undefined, "Test"),
+			"openai-codex/gpt-5.6:max",
+		);
+		assert.doesNotThrow(() => assertMaxThinkingSuffixSupported("openai-codex/gpt-5.6:max", supported, undefined, "Test"));
+		assert.throws(
+			() => applyMetadataGatedThinkingSuffix("openai-codex/gpt-5.5", "max", false, supported, undefined, "Test"),
+			/thinkingLevelMap\.max/,
+		);
+		assert.throws(
+			() => assertMaxThinkingSuffixSupported("gpt-5.6:max", [
+				...supported,
+				{ provider: "other", id: "gpt-5.6", fullId: "other/gpt-5.6", thinkingLevelMap: { max: "max" } },
+			], undefined, "Test"),
+			/thinkingLevelMap\.max/,
+			"ambiguous bare ids must not borrow arbitrary metadata",
 		);
 	});
 

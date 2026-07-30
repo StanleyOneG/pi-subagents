@@ -10,6 +10,7 @@ import type { FSWatcher } from "node:fs";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { ModelScopeConfig } from "../runs/shared/model-scope.ts";
 import type { ResolvedSubagentCapabilityCeiling, SubagentCapabilityAudit } from "../runs/shared/capability-ceiling.ts";
+import type { ModelInfo } from "./model-info.ts";
 
 // ============================================================================
 // Basic Types
@@ -608,11 +609,23 @@ export type AcceptanceEvidenceKind =
 	| "review-findings"
 	| "manual-notes";
 
+export type AcceptanceExpectedCommandResult = "expected-red" | "expected-failure";
+export type AcceptanceCommandResult = "passed" | "failed" | "not-run" | AcceptanceExpectedCommandResult;
+
 export interface AcceptanceGate {
 	id: string;
 	must: string;
 	evidence?: AcceptanceEvidenceKind[];
 	severity?: "required" | "recommended";
+	/** Expected command outcomes this named gate explicitly permits. */
+	allowedCommandOutcomes?: AcceptanceExpectedCommandResult[];
+}
+
+export interface AcceptancePolicyContext {
+	/** Trusted role-card capability; callers cannot self-declare this per run. */
+	capability?: "read-only" | "mutating";
+	/** Empty mutation evidence that a trusted read-only role may mark inapplicable. */
+	notApplicableEvidence?: Array<"changed-files" | "tests-added">;
 }
 
 export interface AcceptanceVerifyCommand {
@@ -638,6 +651,7 @@ export interface AcceptanceConfig {
 	review?: AcceptanceReviewGate | false;
 	stopRules?: string[];
 	reason?: string;
+	context?: AcceptancePolicyContext;
 }
 
 /** Bare "none" is not accepted: use { level: "none", reason: "..." }; false remains a deprecated shorthand. */
@@ -648,6 +662,7 @@ export interface ResolvedAcceptanceGate extends AcceptanceGate {
 	must: string;
 	evidence: AcceptanceEvidenceKind[];
 	severity: "required" | "recommended";
+	allowedCommandOutcomes: AcceptanceExpectedCommandResult[];
 }
 
 export interface ResolvedAcceptanceConfig {
@@ -660,6 +675,13 @@ export interface ResolvedAcceptanceConfig {
 	review?: AcceptanceReviewGate | false;
 	stopRules: string[];
 	reason?: string;
+	context: Required<Pick<AcceptancePolicyContext, "notApplicableEvidence">> & Pick<AcceptancePolicyContext, "capability">;
+}
+
+export interface AcceptanceExpectedCommandOutcome {
+	kind: AcceptanceExpectedCommandResult;
+	gateId: string;
+	reason: string;
 }
 
 export interface AcceptanceReport {
@@ -672,11 +694,15 @@ export interface AcceptanceReport {
 	testsAddedOrUpdated?: string[];
 	commandsRun?: Array<{
 		command: string;
-		result: "passed" | "failed" | "not-run";
+		result: AcceptanceCommandResult;
 		summary: string;
+		/** Required for expected-red/expected-failure and bound to a named gate. */
+		expected?: AcceptanceExpectedCommandOutcome;
 	}>;
 	validationOutput?: string[];
 	residualRisks?: string[];
+	/** Explicit record of empty evidence for a non-mutating/read-only result. */
+	notApplicableEvidence?: Array<"changed-files" | "tests-added">;
 	noStagedFiles?: boolean;
 	diffSummary?: string;
 	reviewFindings?: string[];
@@ -747,6 +773,19 @@ export interface AcceptanceLedger {
 	};
 }
 
+export interface PreflightFailure {
+	resourceType: "skill" | "tool";
+	resources: string[];
+	message: string;
+}
+
+export interface ResourceSkillProvenance {
+	name: string;
+	path: string;
+	source: string;
+	required: boolean;
+}
+
 export interface ProtocolOutputLimit {
 	code: "protocol_output_limit";
 	stream: "stdout" | "stderr";
@@ -759,9 +798,13 @@ export interface ProtocolOutputLimit {
 export interface SingleResult {
 	agent: string;
 	task: string;
+	/** Stable requested child index, including preflight-only failures. */
+	index?: number;
 	/** Resolved launch context for this child. */
 	context?: "fresh" | "fork";
 	exitCode: number;
+	/** Resource validation that rejected the child before model launch. */
+	preflight?: PreflightFailure;
 	processSignal?: string | null;
 	detached?: boolean;
 	detachedReason?: string;
@@ -786,6 +829,9 @@ export interface SingleResult {
 	sessionFile?: string;
 	skills?: string[];
 	skillsWarning?: string;
+	resourceProvenance?: ResourceSkillProvenance[];
+	/** Parent-observed mutating tool activity across all model attempts. */
+	observedMutationAttempt?: boolean;
 	progress?: AgentProgress;
 	progressSummary?: ProgressSummary;
 	toolCalls?: ToolCallSummary[];
@@ -1131,6 +1177,7 @@ export interface AsyncStatus {
 		execution?: ExecutionProjection;
 		review?: ReviewProjection;
 		effects?: EffectsProjection;
+		observedMutationAttempt?: boolean;
 		watchdog?: ChildWatchdogProgress;
 		processTerminal?: ProcessTerminalV1;
 		capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
@@ -1399,6 +1446,8 @@ export interface RunSyncOptions {
 	sessionFile?: string;
 	share?: boolean;
 	outputPath?: string;
+	/** Runtime-owned root for relative outputs; enables private no-follow I/O. */
+	outputPrivateRoot?: string;
 	outputMode?: OutputMode;
 	maxSubagentDepth?: number;
 	/** Effective parent wait-tool setting propagated to the child runtime. */
@@ -1409,14 +1458,20 @@ export interface RunSyncOptions {
 	modelOverride?: string;
 	/** Override the agent's default thinking level for this run */
 	thinkingOverride?: AgentConfig["thinking"];
-	/** Registry models available for heuristic bare-model resolution */
-	availableModels?: Array<{ provider: string; id: string; fullId: string }>;
+	/** Registry models available for resolution and metadata-gated thinking. */
+	availableModels?: ModelInfo[];
 	/** Current parent-session provider to prefer for ambiguous bare model ids */
 	preferredModelProvider?: string;
 	/** Optional subagent model-scope enforcement for fallback candidates */
 	modelScope?: ModelScopeConfig;
+	/** Configured/effective Pi tool names captured by the parent before launch. */
+	availableToolNames?: string[];
 	/** Skills to make available (overrides agent default if provided) */
 	skills?: string[];
+	/** Internal explicit skill selection already separated from resolved behavior. */
+	resourcePreflightSkills?: string[];
+	/** Whether legacy/optional role-card skills remain best effort for this launch. */
+	resourcePreflightUseAgentSkills?: boolean;
 	structuredOutput?: {
 		schema: JsonSchemaObject;
 		schemaPath: string;

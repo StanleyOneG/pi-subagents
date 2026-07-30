@@ -308,6 +308,25 @@ describe("main watchdog review adapter", () => {
 		assert.deepEqual(calls[0]?.options?.env, { WATCHDOG_PROVIDER: "github-copilot" });
 	});
 
+	it("allows explicit max only when in-process watchdog model metadata advertises it", async () => {
+		const supported = model("test", "metadata-max", { thinkingLevelMap: { max: "max" } });
+		const supportedCtx = createCtx({ current: supported, models: [supported] });
+		const supportedConfig = enabledConfig({ model: "test/metadata-max:max" });
+		const selection = await resolveWatchdogReviewModel(supportedCtx, supportedConfig);
+		assert.equal(selection.thinkingLevel, "max");
+
+		const { streamFn, calls } = createStreamFn([fauxAssistantMessage("clean", { stopReason: "stop" })]);
+		await createMainWatchdogReview(supportedCtx, { streamFn })(request(supportedConfig, []));
+		assert.equal(calls[0]?.options?.reasoning, "max");
+
+		const unsupported = model("test", "legacy");
+		const unsupportedCtx = createCtx({ current: unsupported, models: [unsupported] });
+		await assert.rejects(
+			() => resolveWatchdogReviewModel(unsupportedCtx, enabledConfig({ model: "test/legacy", thinking: "max" })),
+			/thinkingLevelMap\.max/,
+		);
+	});
+
 	it("resolves configured model suffixes and thinking deterministically", async () => {
 		const current = model("openai", "gpt-current");
 		const dated = model("openai", "gpt-5-20260707");

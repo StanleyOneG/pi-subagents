@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { PI_CODING_AGENT_PACKAGE_ROOT_ENV } from "../../shared/utils.ts";
 import type { JsonSchemaObject } from "../../shared/types.ts";
+import { ensurePrivateDirectory, readPrivateArtifact, writeArtifact } from "../../shared/artifacts.ts";
 
 export const STRUCTURED_OUTPUT_SCHEMA_ENV = "PI_SUBAGENT_STRUCTURED_OUTPUT_SCHEMA";
 export const STRUCTURED_OUTPUT_CAPTURE_ENV = "PI_SUBAGENT_STRUCTURED_OUTPUT_CAPTURE";
@@ -126,12 +127,20 @@ export function assertJsonSchemaObject(schema: unknown, label = "outputSchema"):
 
 export function createStructuredOutputRuntime(schema: JsonSchemaObject, baseDir?: string): StructuredOutputRuntime {
 	assertJsonSchemaObject(schema);
-	const rootDir = baseDir ?? os.tmpdir();
-	fs.mkdirSync(rootDir, { recursive: true });
-	const dir = fs.mkdtempSync(path.join(rootDir, "pi-subagent-structured-"));
+	// Never chmod the shared system temp root or claim a deterministic cross-user
+	// child beneath it. mkdtemp creates the default runtime root atomically.
+	let dir: string;
+	if (baseDir) {
+		const rootDir = path.resolve(baseDir);
+		ensurePrivateDirectory(rootDir);
+		dir = fs.mkdtempSync(path.join(rootDir, "pi-subagent-structured-"));
+	} else {
+		dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-structured-"));
+	}
+	fs.chmodSync(dir, 0o700);
 	const schemaPath = path.join(dir, "schema.json");
 	const outputPath = path.join(dir, "output.json");
-	fs.writeFileSync(schemaPath, JSON.stringify(schema), { mode: 0o600 });
+	writeArtifact(schemaPath, JSON.stringify(schema));
 	return { schema, schemaPath, outputPath };
 }
 
@@ -154,13 +163,12 @@ export async function validateStructuredOutputValue(schema: JsonSchemaObject, va
 }
 
 export async function readStructuredOutput(runtime: StructuredOutputRuntime): Promise<{ value?: unknown; error?: string }> {
-	if (!fs.existsSync(runtime.outputPath)) {
-		return { error: MISSING_STRUCTURED_OUTPUT_CALL_ERROR };
-	}
 	let value: unknown;
 	try {
-		value = JSON.parse(fs.readFileSync(runtime.outputPath, "utf-8"));
+		value = JSON.parse(readPrivateArtifact(runtime.outputPath));
 	} catch (error) {
+		const code = error && typeof error === "object" && "code" in error ? (error as { code?: unknown }).code : undefined;
+		if (code === "ENOENT" || code === "ENOTDIR") return { error: MISSING_STRUCTURED_OUTPUT_CALL_ERROR };
 		return { error: `Failed to read structured output: ${error instanceof Error ? error.message : String(error)}` };
 	}
 	try {

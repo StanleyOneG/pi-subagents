@@ -153,6 +153,44 @@ body`);
 	}));
 });
 
+describe("agent resource contract frontmatter", () => {
+	it("discovers and serializes required skills, required tools, and acceptance capability", () => withTempHome(() => {
+		const project = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-resource-contract-agent-"));
+		tempDirs.push(project);
+		writeAgent(path.join(project, ".pi", "agents", "reviewer.md"), `---
+name: reviewer
+description: Reviewer
+tools: read,grep,find,ls
+requiredTools: read,grep,find,ls
+requiredSkills: load-project-state,review-plan
+acceptanceCapability: read-only
+---
+Review only`);
+
+		const reviewer = discoverAgents(project, "project").agents.find((agent) => agent.name === "reviewer")!;
+		assert.deepEqual(reviewer.requiredTools, ["read", "grep", "find", "ls"]);
+		assert.deepEqual(reviewer.requiredSkills, ["load-project-state", "review-plan"]);
+		assert.equal(reviewer.acceptanceCapability, "read-only");
+		assert.equal(reviewer.acceptanceRole, "read-only", "Stan capability aliases the upstream acceptance role");
+		const serialized = serializeAgent(reviewer);
+		assert.match(serialized, /^requiredTools: read, grep, find, ls$/m);
+		assert.match(serialized, /^requiredSkills: load-project-state, review-plan$/m);
+		assert.match(serialized, /^acceptanceCapability: read-only$/m);
+	}));
+
+	it("rejects invalid or conflicting acceptance capability declarations", () => withTempHome(() => {
+		for (const [name, fields, expected] of [
+			["invalid", "acceptanceCapability: observer", /expected 'read-only' or 'mutating'/],
+			["conflict", "acceptanceCapability: read-only\nacceptanceRole: writer", /conflicts with acceptanceRole/],
+		] as const) {
+			const project = fs.mkdtempSync(path.join(os.tmpdir(), `pi-subagents-resource-contract-${name}-`));
+			tempDirs.push(project);
+			writeAgent(path.join(project, ".pi", "agents", `${name}.md`), `---\nname: ${name}\ndescription: Invalid\n${fields}\n---\nBody`);
+			assert.throws(() => discoverAgents(project, "project"), expected);
+		}
+	}));
+});
+
 describe("agent simple-scalar list frontmatter", () => {
 	it("discovers newline block lists for all list fields and routes MCP tools", () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-agent-block-list-frontmatter-"));

@@ -7,10 +7,10 @@ import { resolveExecutionAgentScope } from "../agents/agent-scope.ts";
 import { buildSkillInjection, normalizeSkillInput, resolveSkillsWithFallback } from "../agents/skills.ts";
 import { buildAgentMemoryInjection } from "../agents/agent-memory.ts";
 import { buildModelCandidates, resolveEffectiveSubagentModel, type AvailableModelInfo, type ParentModel } from "../runs/shared/model-fallback.ts";
-import { applyThinkingSuffix, resolvePiLaunchToolPlan, type PiLaunchToolPlan } from "../runs/shared/pi-args.ts";
+import { resolvePiLaunchToolPlan, type PiLaunchToolPlan } from "../runs/shared/pi-args.ts";
 import { injectOutputPathSystemPrompt, normalizeSingleOutputOverride, resolveSingleOutputPath } from "../runs/shared/single-output.ts";
 import { getArtifactPaths, getArtifactsDir } from "../shared/artifacts.ts";
-import { resolveEffectiveThinking } from "../shared/model-info.ts";
+import { applyMetadataGatedThinkingSuffix, resolveEffectiveThinking } from "../shared/model-info.ts";
 import { SUBAGENT_LIFECYCLE_ARTIFACT_VERSION, type ArtifactDirPreference, type ArtifactPaths, type JsonSchemaObject, type OutputMode } from "../shared/types.ts";
 import type { ResolvedSubagentCapabilityCeiling, SubagentCapabilityAudit } from "../runs/shared/capability-ceiling.ts";
 import { appendTurnBudgetSystemPrompt } from "../runs/shared/turn-budget.ts";
@@ -31,7 +31,8 @@ export type SubagentLaunchContractReasonCode =
 	| "denied_required_tool"
 	| "invalid_artifact_dir"
 	| "invalid_cwd"
-	| "unsupported_mode";
+	| "unsupported_mode"
+	| "unsupported_thinking";
 
 export interface SubagentLaunchContractDiagnostic {
 	code: SubagentLaunchContractReasonCode | "host_required" | "snapshot_warning";
@@ -259,9 +260,17 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 	const preferredProvider = input.preferredProvider ?? input.parentModel?.provider;
 	const primaryModel = resolveEffectiveSubagentModel(input.model, agent.model, input.parentModel, availableModels, preferredProvider, { scope: discovered.modelScope });
 	const effectiveThinkingConfig = input.thinking !== undefined ? input.thinking : agent.thinking;
-	const model = applyThinkingSuffix(primaryModel, effectiveThinkingConfig, input.thinking !== undefined);
-	const modelCandidates = buildModelCandidates(primaryModel, agent.fallbackModels, availableModels, preferredProvider, { scope: discovered.modelScope })
-		.map((candidate) => applyThinkingSuffix(candidate, effectiveThinkingConfig, input.thinking !== undefined) ?? candidate);
+	let model: string | undefined;
+	let modelCandidates: string[];
+	try {
+		model = applyMetadataGatedThinkingSuffix(primaryModel, effectiveThinkingConfig, input.thinking !== undefined, availableModels, preferredProvider, "Subagent launch preflight");
+		modelCandidates = buildModelCandidates(primaryModel, agent.fallbackModels, availableModels, preferredProvider, { scope: discovered.modelScope })
+			.map((candidate) => applyMetadataGatedThinkingSuffix(candidate, effectiveThinkingConfig, input.thinking !== undefined, availableModels, preferredProvider, "Subagent launch preflight fallback"));
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		diagnostics.push({ code: "unsupported_thinking", severity: "error", message });
+		return { ok: false, code: "unsupported_thinking", message, diagnostics };
+	}
 	let toolPlan: PiLaunchToolPlan;
 	try {
 		toolPlan = resolvePiLaunchToolPlan({
@@ -281,7 +290,9 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 		return { ok: false, code: "denied_required_tool", message, diagnostics };
 	}
 	const artifactsEnabled = input.artifacts !== false;
-	const artifactsDir = artifactsEnabled ? getArtifactsDir(input.parentSessionFile ?? null, effectiveCwd, input.artifactDir ?? "project") : undefined;
+	const artifactsDir = artifactsEnabled
+		? getArtifactsDir(input.parentSessionFile ?? null, effectiveCwd, input.artifactDir ?? "project", input.sessionDir)
+		: undefined;
 	const artifactPaths = artifactsDir ? getArtifactPaths(artifactsDir, runId, agent.name, 0) : undefined;
 	const outputPath = resolveSingleOutputPath(behavior.output, effectiveCwd, effectiveCwd, artifactsDir ? path.join(artifactsDir, "outputs", runId) : undefined);
 	const sessionRoot = input.sessionDir ? path.resolve(input.sessionDir) : input.sessionRoot ? path.join(path.resolve(input.sessionRoot), runId) : undefined;

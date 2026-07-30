@@ -92,6 +92,19 @@ function parseStepBody(agent: string, sectionBody: string): ChainStepConfig {
 			const validation = validateToolBudgetConfig(parsed, `toolBudget for step '${agent}'`);
 			if (validation.error) throw new Error(validation.error);
 			step.toolBudget = parsed as ChainStepConfig["toolBudget"];
+			continue;
+		}
+		if (key === "acceptance") {
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(rawValue);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				throw new Error(`Invalid acceptance JSON in .chain.md step '${agent}': ${message}`);
+			}
+			const errors = validateAcceptanceInput(parsed, `acceptance for step '${agent}'`);
+			if (errors.length > 0) throw new Error(`Invalid acceptance in .chain.md step '${agent}': ${errors.join(" ")}`);
+			step.acceptance = parsed as ChainStepConfig["acceptance"];
 		}
 	}
 
@@ -268,6 +281,7 @@ export function serializeChain(config: ChainConfig): string {
 		else if (Array.isArray(step.skills) && step.skills.length > 0) lines.push(`skills: ${step.skills.join(", ")}`);
 		if (step.progress !== undefined) lines.push(`progress: ${step.progress ? "true" : "false"}`);
 		if (step.toolBudget !== undefined) lines.push(`toolBudget: ${JSON.stringify(step.toolBudget)}`);
+		if (step.acceptance !== undefined) lines.push(`acceptance: ${JSON.stringify(step.acceptance)}`);
 		lines.push("");
 		lines.push(step.task ?? "");
 		if (i < config.steps.length - 1) lines.push("");

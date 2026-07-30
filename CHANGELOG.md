@@ -2,7 +2,13 @@
 
 ## [Unreleased]
 
+### Added
+- Added fail-closed `requiredSkills`/`requiredTools`, best-effort `optionalSkills`, trusted `acceptanceCapability`, and resolved skill provenance across foreground, async, static-chain, and dynamic-fanout launches.
+- Added named acceptance-gate support for explicit `expected-red` and `expected-failure` command outcomes while preserving semantic `BLOCKED` results from trusted read-only reviewers.
+
 ### Fixed
+- Required resolved Pi model metadata to advertise `thinkingLevelMap.max` before accepting `:max` across execution, preflight, profiles, slash commands, and watchdog configuration.
+- Hardened runtime-owned artifacts and outputs with private permissions, traversal/link defenses, private atomic coordination JSON, and transactional cleanup for async validation failures.
 - Honored Pi package-manifest `pi.skills` source globs and `!`/`+`/`-` override patterns during subagent skill discovery.
 - Kept pi-intercom stable IDs from leaking into child sessions and used the current intercom runtime ID for unnamed supervisor targets.
 - Improved acceptance policy validation errors and tool-schema guidance for invalid evidence kinds. Thanks to @atimofeev for #672.

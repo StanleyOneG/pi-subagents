@@ -3,8 +3,10 @@ import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type {
+	AcceptanceCommandResult,
 	AcceptanceConfig,
 	AcceptanceEvidenceKind,
+	AcceptanceExpectedCommandResult,
 	AcceptanceInput,
 	AgentContract,
 	AcceptanceLedger,
@@ -14,6 +16,7 @@ import type {
 	AcceptanceRuntimeCheck,
 	AcceptanceRuntimeCheckStatus,
 	AcceptanceReviewResult,
+	AcceptancePolicyContext,
 	AcceptanceVerifyCommand,
 	AcceptanceVerifyResult,
 	ResolvedAcceptanceConfig,
@@ -46,8 +49,11 @@ const VALID_EVIDENCE_KINDS: AcceptanceEvidenceKind[] = [
 const VALID_EVIDENCE = new Set<AcceptanceEvidenceKind>(VALID_EVIDENCE_KINDS);
 const ACCEPTANCE_EVIDENCE_HELP = `Supported evidence kinds: ${VALID_EVIDENCE_KINDS.join(", ")}. Example: { level: "checked", evidence: ["commands-run", "changed-files"] }.`;
 const ACCEPTANCE_OBJECT_EXAMPLE = "Example: { level: \"checked\", evidence: [\"commands-run\", \"changed-files\"] }.";
-const ACCEPTANCE_CONFIG_KEYS = new Set(["level", "criteria", "evidence", "verify", "review", "stopRules", "reason"]);
-const ACCEPTANCE_GATE_KEYS = new Set(["id", "must", "evidence", "severity"]);
+const ACCEPTANCE_CONFIG_KEYS = new Set(["level", "criteria", "evidence", "verify", "review", "stopRules", "reason", "context"]);
+const ACCEPTANCE_GATE_KEYS = new Set(["id", "must", "evidence", "severity", "allowedCommandOutcomes"]);
+const ACCEPTANCE_CONTEXT_KEYS = new Set(["capability", "notApplicableEvidence"]);
+const EXPECTED_COMMAND_RESULTS = new Set<AcceptanceExpectedCommandResult>(["expected-red", "expected-failure"]);
+const COMMAND_RESULTS = new Set<AcceptanceCommandResult>(["passed", "failed", "not-run", ...EXPECTED_COMMAND_RESULTS]);
 const ACCEPTANCE_VERIFY_KEYS = new Set(["id", "command", "timeoutMs", "cwd", "env", "allowFailure"]);
 const ACCEPTANCE_REVIEW_KEYS = new Set(["agent", "focus", "required"]);
 const EXPLICIT_REVIEWED_UNAVAILABLE = "is an achieved status, not a requestable acceptance level. For a read-only reviewer call, omit acceptance. To require independent review of a writer result, use acceptance.review.required and orchestrate the reviewer separately.";
@@ -76,6 +82,7 @@ function requiredEvidenceForLevel(level: Exclude<AcceptanceLevel, "auto">): Acce
 function inferLevel(input: {
 	agentName: string;
 	acceptanceRole?: AcceptanceRole;
+	acceptanceCapability?: AcceptancePolicyContext["capability"];
 	task?: string;
 	mode?: SubagentRunMode;
 	async?: boolean;
@@ -85,6 +92,14 @@ function inferLevel(input: {
 	const agent = input.agentName.toLowerCase();
 	const task = input.task?.toLowerCase() ?? "";
 	const reasons: string[] = [];
+	if (input.acceptanceCapability === "read-only") {
+		return {
+			level: "attested",
+			reasons: ["declared read-only capability"],
+			criteria: ["Return concrete findings with file paths and severity when applicable"],
+			evidence: ["review-findings", "residual-risks"],
+		};
+	}
 	// Declared roles replace name heuristics, so use the full writer grammar to detect explicit mutation independently of the actual agent name.
 	const intent = classifyTaskMutationIntent(input.acceptanceRole ? "worker" : input.agentName, input.task ?? "");
 	const readOnlyTask = intent.kind === "read-only"
@@ -221,6 +236,16 @@ export function validateAcceptanceInput(input: unknown, pathLabel = "acceptance"
 			if (gate.severity !== undefined && gate.severity !== "required" && gate.severity !== "recommended") {
 				errors.push(`${criterionPath}.severity must be required or recommended.`);
 			}
+			if (gate.allowedCommandOutcomes !== undefined && !Array.isArray(gate.allowedCommandOutcomes)) {
+				errors.push(`${criterionPath}.allowedCommandOutcomes must be an array.`);
+			}
+			if (Array.isArray(gate.allowedCommandOutcomes)) {
+				for (const [outcomeIndex, outcome] of gate.allowedCommandOutcomes.entries()) {
+					if (typeof outcome !== "string" || !EXPECTED_COMMAND_RESULTS.has(outcome as AcceptanceExpectedCommandResult)) {
+						errors.push(`${criterionPath}.allowedCommandOutcomes[${outcomeIndex}] must be expected-red or expected-failure.`);
+					}
+				}
+			}
 		}
 	}
 	if (Array.isArray(value.evidence)) {
@@ -276,6 +301,29 @@ export function validateAcceptanceInput(input: unknown, pathLabel = "acceptance"
 			if (review.required !== undefined && typeof review.required !== "boolean") errors.push(`${pathLabel}.review.required must be a boolean.`);
 		}
 	}
+	if (value.context !== undefined) {
+		if (!value.context || typeof value.context !== "object" || Array.isArray(value.context)) {
+			errors.push(`${pathLabel}.context must be an object.`);
+		} else {
+			const context = value.context as Record<string, unknown>;
+			for (const key of Object.keys(context)) {
+				if (!ACCEPTANCE_CONTEXT_KEYS.has(key)) errors.push(`${pathLabel}.context.${key} is not supported.`);
+			}
+			if (context.capability !== undefined) {
+				errors.push(`${pathLabel}.context.capability is reserved for trusted agent role cards; set acceptanceCapability on the agent instead.`);
+			}
+			if (context.notApplicableEvidence !== undefined && !Array.isArray(context.notApplicableEvidence)) {
+				errors.push(`${pathLabel}.context.notApplicableEvidence must be an array.`);
+			}
+			if (Array.isArray(context.notApplicableEvidence)) {
+				for (const [index, kind] of context.notApplicableEvidence.entries()) {
+					if (kind !== "changed-files" && kind !== "tests-added") {
+						errors.push(`${pathLabel}.context.notApplicableEvidence[${index}] must be changed-files or tests-added.`);
+					}
+				}
+			}
+		}
+	}
 	if (value.stopRules !== undefined && !Array.isArray(value.stopRules)) errors.push(`${pathLabel}.stopRules must be an array.`);
 	if (Array.isArray(value.stopRules)) {
 		for (const [index, item] of value.stopRules.entries()) {
@@ -310,16 +358,25 @@ export function validateExecutionAcceptance(input: {
 	return errors;
 }
 
-function normalizeCriteria(criteria: Array<string | { id?: string; must?: string; evidence?: AcceptanceEvidenceKind[]; severity?: "required" | "recommended" }> | undefined, evidence: AcceptanceEvidenceKind[]): ResolvedAcceptanceGate[] {
+type AcceptanceCriterionInput = string | {
+	id?: string;
+	must?: string;
+	evidence?: AcceptanceEvidenceKind[];
+	severity?: "required" | "recommended";
+	allowedCommandOutcomes?: AcceptanceExpectedCommandResult[];
+};
+
+function normalizeCriteria(criteria: AcceptanceCriterionInput[] | undefined, evidence: AcceptanceEvidenceKind[]): ResolvedAcceptanceGate[] {
 	return (criteria ?? []).map((criterion, index) => {
 		if (typeof criterion === "string") {
-			return { id: `criterion-${index + 1}`, must: criterion, evidence, severity: "required" };
+			return { id: `criterion-${index + 1}`, must: criterion, evidence, severity: "required", allowedCommandOutcomes: [] };
 		}
 		return {
 			id: criterion.id?.trim() || `criterion-${index + 1}`,
 			must: criterion.must ?? "",
 			evidence: criterion.evidence?.filter((item) => VALID_EVIDENCE.has(item)) ?? evidence,
 			severity: criterion.severity ?? "required",
+			allowedCommandOutcomes: criterion.allowedCommandOutcomes?.filter((item) => EXPECTED_COMMAND_RESULTS.has(item)) ?? [],
 		};
 	}).filter((criterion) => criterion.must.trim());
 }
@@ -328,6 +385,8 @@ export function resolveEffectiveAcceptance(input: {
 	explicit?: AcceptanceInput;
 	agentName: string;
 	acceptanceRole?: AcceptanceRole;
+	/** Trusted capability resolved from the agent role card. */
+	acceptanceCapability?: AcceptancePolicyContext["capability"];
 	task?: string;
 	mode?: SubagentRunMode;
 	async?: boolean;
@@ -337,15 +396,17 @@ export function resolveEffectiveAcceptance(input: {
 }): ResolvedAcceptanceConfig {
 	const explicit = normalizeAcceptanceInput(input.explicit);
 	const explicitLevel = normalizeLevel(explicit.level);
+	const declaredCapability = input.acceptanceCapability;
+	const acceptanceContext: ResolvedAcceptanceConfig["context"] = {
+		...(declaredCapability ? { capability: declaredCapability } : {}),
+		notApplicableEvidence: declaredCapability === "read-only" ? ["changed-files", "tests-added"] : [],
+	};
 	if (isAgentContractV1(input.agentContract)) {
 		const level = explicitAcceptanceCanDisable(explicit) || explicitLevel === "auto"
 			? "none"
 			: explicitLevel;
 		const evidence = unique(explicit.evidence ?? []);
-		const criteria = normalizeCriteria(
-			explicit.criteria as Array<string | { id?: string; must?: string; evidence?: AcceptanceEvidenceKind[]; severity?: "required" | "recommended" }> | undefined,
-			evidence,
-		);
+		const criteria = normalizeCriteria(explicit.criteria as AcceptanceCriterionInput[] | undefined, evidence);
 		return {
 			level,
 			explicit: input.explicit !== undefined,
@@ -356,6 +417,7 @@ export function resolveEffectiveAcceptance(input: {
 			review: explicit.review,
 			stopRules: explicit.stopRules ?? [],
 			reason: explicit.reason,
+			context: acceptanceContext,
 		};
 	}
 	const inferred = inferLevel(input);
@@ -366,7 +428,7 @@ export function resolveEffectiveAcceptance(input: {
 			: (LEVEL_RANK[explicitLevel] >= LEVEL_RANK[inferred.level] ? explicitLevel : inferred.level);
 	const evidence = unique([...(level === inferred.level ? inferred.evidence : requiredEvidenceForLevel(level)), ...(explicit.evidence ?? [])]);
 	const criteria = normalizeCriteria(
-		(explicit.criteria?.length ? explicit.criteria : inferred.criteria) as Array<string | { id?: string; must?: string; evidence?: AcceptanceEvidenceKind[]; severity?: "required" | "recommended" }>,
+		(explicit.criteria?.length ? explicit.criteria : inferred.criteria) as AcceptanceCriterionInput[],
 		evidence,
 	);
 	const review = explicit.review !== undefined ? explicit.review : inferred.review;
@@ -380,6 +442,7 @@ export function resolveEffectiveAcceptance(input: {
 		review,
 		stopRules: explicit.stopRules ?? [],
 		reason: explicit.reason,
+		context: acceptanceContext,
 	};
 }
 
@@ -409,6 +472,13 @@ export function formatAcceptancePrompt(acceptance: ResolvedAcceptanceConfig, opt
 		lines.push("", `Review gate: ${acceptance.review.required === false ? "optional" : "required"}${acceptance.review.agent ? ` by ${acceptance.review.agent}` : ""}.`);
 		if (acceptance.review.focus) lines.push(`Review focus: ${acceptance.review.focus}`);
 	}
+	const expectedCommandGates = acceptance.criteria.filter((criterion) => criterion.allowedCommandOutcomes.length > 0);
+	if (expectedCommandGates.length > 0) {
+		lines.push("", "Permitted expected command outcomes:", ...expectedCommandGates.map((criterion) => `- ${criterion.id}: ${criterion.allowedCommandOutcomes.join(", ")}`));
+	}
+	if (acceptance.context.notApplicableEvidence.length > 0) {
+		lines.push("", `Evidence allowed as not applicable: ${acceptance.context.notApplicableEvidence.join(", ")}`);
+	}
 	if (acceptance.stopRules.length > 0) {
 		lines.push("", "Stop rules:", ...acceptance.stopRules.map((rule) => `- ${rule}`));
 	}
@@ -417,7 +487,8 @@ export function formatAcceptancePrompt(acceptance: ResolvedAcceptanceConfig, opt
 		"Finish with a fenced JSON block tagged `acceptance-report` in this shape:",
 		"Use empty arrays when no items apply; array fields contain strings unless object entries are shown.",
 		"`criteriaSatisfied[].status` must be exactly one of: satisfied, not-satisfied, not-applicable.",
-		"`commandsRun[].result` must be exactly one of: passed, failed, not-run.",
+		"`commandsRun[].result` must be exactly one of: passed, failed, not-run, expected-red, expected-failure.",
+		"Expected outcomes require `expected: { kind, gateId, reason }` and must match one named required command-evidence gate.",
 		"`manualNotes` and `notes` are optional strings; an empty string means no note and does not satisfy `manual-notes` evidence.",
 		"```acceptance-report",
 		JSON.stringify({
@@ -429,6 +500,7 @@ export function formatAcceptancePrompt(acceptance: ResolvedAcceptanceConfig, opt
 			commandsRun: [{ command: "command", result: "passed", summary: "short result" }],
 			validationOutput: ["validation output or concise summary"],
 			residualRisks: ["none"],
+			notApplicableEvidence: acceptance.context.notApplicableEvidence,
 			noStagedFiles: true,
 			diffSummary: "short description of the diff",
 			reviewFindings: ["blocker: file.ts:12 - issue found, or no blockers"],
@@ -479,6 +551,8 @@ const ACCEPTANCE_REPORT_FIELDS: Record<string, keyof AcceptanceReport> = {
 	validation_output: "validationOutput",
 	residualRisks: "residualRisks",
 	residual_risks: "residualRisks",
+	notApplicableEvidence: "notApplicableEvidence",
+	not_applicable_evidence: "notApplicableEvidence",
 	noStagedFiles: "noStagedFiles",
 	no_staged_files: "noStagedFiles",
 	diffSummary: "diffSummary",
@@ -491,7 +565,8 @@ const ACCEPTANCE_REPORT_FIELDS: Record<string, keyof AcceptanceReport> = {
 };
 
 const CRITERION_REPORT_FIELDS = new Set(["id", "status", "evidence"]);
-const COMMAND_REPORT_FIELDS = new Set(["command", "result", "summary"]);
+const COMMAND_REPORT_FIELDS = new Set(["command", "result", "summary", "expected"]);
+const EXPECTED_COMMAND_REPORT_FIELDS = new Set(["kind", "gateId", "reason"]);
 
 function normalizedToken(value: string): string {
 	return value.trim().toLowerCase().replace(/[\s_]+/g, "-").replace(/-+/g, "-");
@@ -540,7 +615,27 @@ function normalizeCommandReport(value: unknown, pathLabel: string, errors: strin
 			errors.push(`${pathLabel}.${key}: unsupported acceptance command field`);
 			continue;
 		}
-		normalized[key] = key === "result" ? normalizeCommandResult(fieldValue) : fieldValue;
+		if (key === "result") {
+			normalized[key] = normalizeCommandResult(fieldValue);
+			continue;
+		}
+		if (key === "expected" && fieldValue && typeof fieldValue === "object" && !Array.isArray(fieldValue)) {
+			const expected: Record<string, unknown> = {};
+			for (const [expectedKey, expectedValue] of Object.entries(fieldValue as Record<string, unknown>)) {
+				if (!EXPECTED_COMMAND_REPORT_FIELDS.has(expectedKey)) {
+					errors.push(`${pathLabel}.expected.${expectedKey}: unsupported expected command field`);
+					continue;
+				}
+				expected[expectedKey] = expectedKey === "gateId" && typeof expectedValue === "string"
+					? normalizedToken(expectedValue)
+					: expectedKey === "kind"
+						? normalizeCommandResult(expectedValue)
+						: expectedValue;
+			}
+			normalized[key] = expected;
+			continue;
+		}
+		normalized[key] = fieldValue;
 	}
 	return normalized;
 }
@@ -619,6 +714,7 @@ function hasGenericAcceptanceReportSignal(value: unknown): boolean {
 		"commandsRun",
 		"validationOutput",
 		"residualRisks",
+		"notApplicableEvidence",
 		"noStagedFiles",
 		"diffSummary",
 		"reviewFindings",
@@ -819,8 +915,9 @@ function validateAcceptanceReport(value: unknown, pathLabel = ""): { report?: Ac
 				if (criterion.id !== undefined && typeof criterion.id !== "string") {
 					pushTypeError(errors, `${itemPath}.id`, "string", criterion.id);
 				} else if (typeof criterion.id === "string" && criterion.id) {
-					if (criterionIds.has(criterion.id)) errors.push(`${itemPath}.id: duplicate normalized criterion id '${criterion.id}'`);
-					criterionIds.add(criterion.id);
+					const normalizedId = normalizedToken(criterion.id);
+					if (criterionIds.has(normalizedId)) errors.push(`${itemPath}.id: duplicate normalized criterion id '${normalizedId}'`);
+					criterionIds.add(normalizedId);
 				}
 				if (criterion.status !== "satisfied" && criterion.status !== "not-satisfied" && criterion.status !== "not-applicable") {
 					pushTypeError(errors, `${itemPath}.status`, "one of \"satisfied\", \"not-satisfied\", \"not-applicable\"", criterion.status);
@@ -841,17 +938,40 @@ function validateAcceptanceReport(value: unknown, pathLabel = ""): { report?: Ac
 					pushTypeError(errors, itemPath, "object", item);
 					continue;
 				}
-				const command = item as { command?: unknown; result?: unknown; summary?: unknown };
+				const command = item as { command?: unknown; result?: unknown; summary?: unknown; expected?: unknown };
 				if (typeof command.command !== "string" || !command.command.trim()) pushTypeError(errors, `${itemPath}.command`, "non-empty string", command.command);
-				if (command.result !== "passed" && command.result !== "failed" && command.result !== "not-run") {
-					pushTypeError(errors, `${itemPath}.result`, "one of \"passed\", \"failed\", \"not-run\"", command.result);
+				if (typeof command.result !== "string" || !COMMAND_RESULTS.has(command.result as AcceptanceCommandResult)) {
+					pushTypeError(errors, `${itemPath}.result`, "one of \"passed\", \"failed\", \"not-run\", \"expected-red\", \"expected-failure\"", command.result);
 				}
 				if (typeof command.summary !== "string" || !command.summary.trim()) pushTypeError(errors, `${itemPath}.summary`, "non-empty string", command.summary);
+				const expectedResult = typeof command.result === "string" && EXPECTED_COMMAND_RESULTS.has(command.result as AcceptanceExpectedCommandResult);
+				if (expectedResult) {
+					if (!command.expected || typeof command.expected !== "object" || Array.isArray(command.expected)) {
+						pushTypeError(errors, `${itemPath}.expected`, "{ kind, gateId, reason }", command.expected);
+					} else {
+						const expected = command.expected as { kind?: unknown; gateId?: unknown; reason?: unknown };
+						if (expected.kind !== command.result) pushTypeError(errors, `${itemPath}.expected.kind`, JSON.stringify(command.result), expected.kind);
+						if (typeof expected.gateId !== "string" || !expected.gateId.trim()) pushTypeError(errors, `${itemPath}.expected.gateId`, "non-empty string", expected.gateId);
+						if (typeof expected.reason !== "string" || !expected.reason.trim()) pushTypeError(errors, `${itemPath}.expected.reason`, "non-empty string", expected.reason);
+					}
+				} else if (command.expected !== undefined) {
+					errors.push(`${itemPath}.expected is only valid with expected-red or expected-failure.`);
+				}
 			}
 		}
 	}
 	if (report.validationOutput !== undefined) validateStringArrayField(errors, report.validationOutput, pathFor(pathLabel, "validationOutput"));
 	if (report.residualRisks !== undefined) validateStringArrayField(errors, report.residualRisks, pathFor(pathLabel, "residualRisks"));
+	if (report.notApplicableEvidence !== undefined) {
+		if (!Array.isArray(report.notApplicableEvidence)) pushTypeError(errors, pathFor(pathLabel, "notApplicableEvidence"), "array", report.notApplicableEvidence);
+		else {
+			for (const [index, kind] of report.notApplicableEvidence.entries()) {
+				if (kind !== "changed-files" && kind !== "tests-added") {
+					errors.push(`${pathFor(pathLabel, "notApplicableEvidence")}[${index}] must be changed-files or tests-added.`);
+				}
+			}
+		}
+	}
 	if (report.noStagedFiles !== undefined && typeof report.noStagedFiles !== "boolean") pushTypeError(errors, pathFor(pathLabel, "noStagedFiles"), "boolean", report.noStagedFiles);
 	if (report.diffSummary !== undefined && (typeof report.diffSummary !== "string" || !report.diffSummary.trim())) pushTypeError(errors, pathFor(pathLabel, "diffSummary"), "non-empty string", report.diffSummary);
 	if (report.reviewFindings !== undefined) validateStringArrayField(errors, report.reviewFindings, pathFor(pathLabel, "reviewFindings"));
@@ -864,6 +984,7 @@ function validateAcceptanceReport(value: unknown, pathLabel = ""): { report?: Ac
 		|| report.commandsRun !== undefined
 		|| report.validationOutput !== undefined
 		|| report.residualRisks !== undefined
+		|| report.notApplicableEvidence !== undefined
 		|| report.noStagedFiles !== undefined
 		|| report.diffSummary !== undefined
 		|| report.manualNotes !== undefined
@@ -884,14 +1005,25 @@ function checkCriteriaSatisfied(criteria: ResolvedAcceptanceGate[], report: Acce
 	});
 }
 
-function reportEvidenceStatus(report: AcceptanceReport, kind: AcceptanceEvidenceKind): AcceptanceRuntimeCheckStatus {
+function evidenceExplicitlyNotApplicable(
+	acceptance: ResolvedAcceptanceConfig,
+	report: AcceptanceReport,
+	kind: "changed-files" | "tests-added",
+): boolean {
+	return acceptance.context.capability === "read-only"
+		&& acceptance.context.notApplicableEvidence.includes(kind)
+		&& report.notApplicableEvidence?.includes(kind) === true
+		&& (kind === "changed-files" ? report.changedFiles?.length === 0 : report.testsAddedOrUpdated?.length === 0);
+}
+
+function reportEvidenceStatus(acceptance: ResolvedAcceptanceConfig, report: AcceptanceReport, kind: AcceptanceEvidenceKind): AcceptanceRuntimeCheckStatus {
 	switch (kind) {
 		case "changed-files":
-			if (!isStringArray(report.changedFiles)) return "failed";
-			return report.changedFiles.length === 0 ? "not-applicable" : "passed";
+			if (isStringArray(report.changedFiles) && report.changedFiles.length > 0) return "passed";
+			return evidenceExplicitlyNotApplicable(acceptance, report, kind) ? "not-applicable" : "failed";
 		case "tests-added":
-			if (!isStringArray(report.testsAddedOrUpdated)) return "failed";
-			return report.testsAddedOrUpdated.length === 0 ? "not-applicable" : "passed";
+			if (isStringArray(report.testsAddedOrUpdated) && report.testsAddedOrUpdated.length > 0) return "passed";
+			return evidenceExplicitlyNotApplicable(acceptance, report, kind) ? "not-applicable" : "failed";
 		case "commands-run": return Array.isArray(report.commandsRun) && report.commandsRun.length > 0 ? "passed" : "failed";
 		case "validation-output": return isStringArray(report.validationOutput) && report.validationOutput.length > 0 ? "passed" : "failed";
 		case "residual-risks": return isStringArray(report.residualRisks) ? "passed" : "failed";
@@ -913,10 +1045,39 @@ function checkNoStagedFiles(cwd: string): AcceptanceRuntimeCheck {
 		: { id: "no-staged-files", status: "failed", message: `Staged files present: ${staged.join(", ")}` };
 }
 
+function checkCommandOutcomes(acceptance: ResolvedAcceptanceConfig, report: AcceptanceReport): AcceptanceRuntimeCheck[] {
+	return (report.commandsRun ?? []).map((command, index) => {
+		const id = `command:${index + 1}`;
+		if (command.result === "failed" || command.result === "not-run") {
+			return { id, status: "failed" as const, message: `Command '${command.command}' reported ${command.result}: ${command.summary}` };
+		}
+		if (command.result === "passed") {
+			return { id, status: "passed" as const, message: `Command '${command.command}' passed.` };
+		}
+		const expected = command.expected;
+		const matchingRequiredGates = expected
+			? acceptance.criteria.filter((criterion) =>
+				normalizedToken(criterion.id) === normalizedToken(expected.gateId)
+					&& criterion.severity === "required"
+					&& criterion.evidence.includes("commands-run")
+					&& criterion.allowedCommandOutcomes.includes(command.result),
+			)
+			: [];
+		if (!expected || matchingRequiredGates.length !== 1) {
+			return {
+				id,
+				status: "failed" as const,
+				message: `Command '${command.command}' reported ${command.result} without exactly one required command-evidence gate that permits it.`,
+			};
+		}
+		return { id, status: "passed" as const, message: `Command '${command.command}' reported permitted ${command.result} for required gate '${matchingRequiredGates[0]!.id}'.` };
+	});
+}
+
 function runStructuralChecks(acceptance: ResolvedAcceptanceConfig, report: AcceptanceReport, cwd: string): AcceptanceRuntimeCheck[] {
 	const checks: AcceptanceRuntimeCheck[] = [];
 	for (const kind of acceptance.evidence) {
-		const status = reportEvidenceStatus(report, kind);
+		const status = reportEvidenceStatus(acceptance, report, kind);
 		checks.push({
 			id: `evidence:${kind}`,
 			status,
@@ -948,6 +1109,9 @@ export function aggregateAcceptanceReport(input: {
 	const childReports = input.results.map((result) => result.acceptance?.childReport).filter((report): report is AcceptanceReport => Boolean(report));
 	const blockers = input.results.filter((result) => result.exitCode !== 0 || result.acceptance?.status === "rejected");
 	const successfulChildren = input.results.length > 0 && blockers.length === 0;
+	const notApplicableEvidence = (["changed-files", "tests-added"] as const).filter((kind) =>
+		childReports.length > 0 && childReports.every((report) => report.notApplicableEvidence?.includes(kind)),
+	);
 	return {
 		criteriaSatisfied: [
 			{ id: "criterion-1", status: successfulChildren ? "satisfied" : "not-satisfied", evidence: successfulChildren ? `All ${input.results.length} dynamic child run(s) completed without child or acceptance blockers.` : "Dynamic fanout produced no accepted child evidence." },
@@ -966,6 +1130,7 @@ export function aggregateAcceptanceReport(input: {
 			...childReports.flatMap((report) => report.residualRisks ?? []),
 			...blockers.map((result) => `${result.agent}: ${result.error ?? "child or acceptance gate failed"}`),
 		]),
+		notApplicableEvidence,
 		noStagedFiles: childReports.length > 0 && childReports.every((report) => report.noStagedFiles === true),
 		reviewFindings: uniqueStrings(childReports.flatMap((report) => report.reviewFindings ?? [])),
 		manualNotes: input.notes ?? `Aggregated acceptance evidence from ${input.results.length} dynamic fanout child run(s).`,
@@ -1058,6 +1223,8 @@ export async function evaluateAcceptance(input: {
 	 * the assistant output when `authoritative` (outputMode "file-only").
 	 */
 	fileOutput?: { content: string; path: string; authoritative?: boolean };
+	/** Runtime signal derived from parsed tool events, never child-supplied evidence. */
+	observedMutationAttempt?: boolean;
 	report?: AcceptanceReport;
 	reviewResult?: AcceptanceReviewResult;
 	signal?: AbortSignal;
@@ -1076,7 +1243,16 @@ export async function evaluateAcceptance(input: {
 		runtimeChecks: [],
 		verifyRuns: [],
 	};
-	if (acceptance.level === "none") return ledger;
+	if (acceptance.context.capability === "read-only" && input.observedMutationAttempt) {
+		ledger.status = "rejected";
+		ledger.evidenceStatus = "rejected";
+		ledger.runtimeChecks.push({
+			id: "read-only-capability",
+			status: "failed",
+			message: "Read-only acceptance capability was violated by an observed mutation attempt.",
+		});
+		return ledger;
+	}
 
 	const parsed = input.report
 		? (() => {
@@ -1086,11 +1262,34 @@ export async function evaluateAcceptance(input: {
 				: { error: `Failed to parse acceptance-report: Invalid acceptance-report: ${validation.errors.join("; ")}` };
 		})()
 		: parseAcceptanceReportSources(input.output, input.fileOutput);
+	if (acceptance.level === "none") {
+		if (parsed.report) {
+			ledger.childReport = parsed.report;
+			ledger.runtimeChecks = checkCommandOutcomes(acceptance, parsed.report);
+			if (ledger.runtimeChecks.some((check) => check.status === "failed")) {
+				ledger.status = "rejected";
+				ledger.evidenceStatus = "rejected";
+			}
+		} else if (parsed.error && parsed.error !== ACCEPTANCE_REPORT_NOT_FOUND) {
+			ledger.childReportParseError = parsed.error;
+			ledger.runtimeChecks.push({ id: "attestation", status: "failed", message: parsed.error });
+			ledger.status = "rejected";
+			ledger.evidenceStatus = "rejected";
+		}
+		return ledger;
+	}
+
 	const needsReport = acceptanceRequiresChildReport(acceptance);
 	if (parsed.report) {
 		ledger.childReport = parsed.report;
 		ledger.status = "attested";
 		ledger.evidenceStatus = "attested";
+		ledger.runtimeChecks = checkCommandOutcomes(acceptance, parsed.report);
+		if (ledger.runtimeChecks.some((check) => check.status === "failed")) {
+			ledger.status = "rejected";
+			ledger.evidenceStatus = "rejected";
+			return ledger;
+		}
 	} else if (!input.reportOptional || needsReport || parsed.error !== ACCEPTANCE_REPORT_NOT_FOUND) {
 		ledger.childReportParseError = parsed.error;
 		ledger.runtimeChecks.push({ id: "attestation", status: "failed", message: parsed.error ?? "Structured acceptance report missing." });

@@ -6,6 +6,7 @@ import { Type, type Static } from "typebox";
 import { resolveModelCandidate } from "../runs/shared/model-fallback.ts";
 import { resolveEffectiveThinking, splitKnownThinkingSuffix, THINKING_LEVELS, toModelInfo } from "../shared/model-info.ts";
 import type { WatchdogReviewFunction, WatchdogReviewRequest } from "./runtime.ts";
+import { assertWatchdogThinkingSupported } from "./model-selection.ts";
 import {
 	WATCHDOG_WARNING_CATEGORIES,
 	WATCHDOG_WARNING_CONFIDENCES,
@@ -124,15 +125,16 @@ export async function resolveWatchdogReviewModel(
 ): Promise<WatchdogReviewModelSelection> {
 	if (config.main.model) {
 		const resolved = resolveConfiguredModel(ctx, config.main.model);
+		const thinkingLevel = resolveReviewThinking({
+			modelString: resolved.modelString,
+			configThinking: config.main.thinking,
+			ctx,
+			allowContextThinking: false,
+			currentThinkingLevel: options.currentThinkingLevel,
+		});
 		return {
 			model: resolved.model,
-			thinkingLevel: resolveReviewThinking({
-				modelString: resolved.modelString,
-				configThinking: config.main.thinking,
-				ctx,
-				allowContextThinking: false,
-				currentThinkingLevel: options.currentThinkingLevel,
-			}),
+			thinkingLevel: assertWatchdogThinkingSupported(toModelInfo(resolved.model), thinkingLevel, "watchdog model/config"),
 			auth: await resolveReviewAuth(ctx, resolved.model),
 			explicit: true,
 		};
@@ -142,15 +144,16 @@ export async function resolveWatchdogReviewModel(
 	if (!currentModel) {
 		throw new Error("Main watchdog review cannot run because the current Pi session model is unavailable and subagents.watchdog.main.model is not configured.");
 	}
+	const thinkingLevel = resolveReviewThinking({
+		modelString: fullModelId(currentModel),
+		configThinking: config.main.thinking,
+		ctx,
+		allowContextThinking: true,
+		currentThinkingLevel: options.currentThinkingLevel,
+	});
 	return {
 		model: currentModel,
-		thinkingLevel: resolveReviewThinking({
-			modelString: fullModelId(currentModel),
-			configThinking: config.main.thinking,
-			ctx,
-			allowContextThinking: true,
-			currentThinkingLevel: options.currentThinkingLevel,
-		}),
+		thinkingLevel: assertWatchdogThinkingSupported(toModelInfo(currentModel), thinkingLevel, "watchdog model/config"),
 		auth: await resolveReviewAuth(ctx, currentModel),
 		explicit: false,
 	};

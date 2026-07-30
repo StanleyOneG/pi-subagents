@@ -2,11 +2,11 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@e
 import { Text } from "@earendil-works/pi-tui";
 import { resolveEffectiveThinking, splitKnownThinkingSuffix, THINKING_LEVELS, type ThinkingLevel } from "../shared/model-info.ts";
 import { SLASH_TEXT_RESULT_TYPE } from "../shared/types.ts";
-import { recommendStrongWatchdogModel, resolveWatchdogModelInput, parseWatchdogThinkingInput } from "./model-selection.ts";
+import { assertWatchdogConfigurationSupported, assertWatchdogResolvedConfigurationSupported, recommendStrongWatchdogModel, resolveWatchdogModelInput, parseWatchdogThinkingInput, watchdogConfigurationValidationErrors } from "./model-selection.ts";
 import { renderWatchdogWarning } from "./render.ts";
 import { createMainWatchdogReview } from "./review.ts";
 import { MainWatchdogRuntime, type WatchdogReviewFunction } from "./runtime.ts";
-import { getWatchdogUserSettingsPath, writeUserWatchdogEnabled, writeWatchdogModelSettings } from "./settings.ts";
+import { getWatchdogUserSettingsPath, readWatchdogPersistentTargetState, resolveWatchdogConfig, writeUserWatchdogEnabled, writeWatchdogModelSettings } from "./settings.ts";
 import {
 	SUBAGENT_WATCHDOG_WARNING_TYPE,
 	type WatchdogRuntimeStatus,
@@ -61,6 +61,10 @@ function mainThinkingLine(snapshot: ReturnType<MainWatchdogRuntime["getSnapshot"
 	return typeof currentThinking === "string" ? `current session (${currentThinking})` : "current session";
 }
 
+function watchdogModelConfigErrors(snapshot: ReturnType<MainWatchdogRuntime["getSnapshot"]>, ctx: ExtensionContext): string[] {
+	return watchdogConfigurationValidationErrors(ctx, snapshot.config, "watchdog status");
+}
+
 function mainModelLine(snapshot: ReturnType<MainWatchdogRuntime["getSnapshot"]>, ctx: ExtensionContext): string {
 	if (snapshot.config.main.model) {
 		const source = snapshot.sessionModelOverride?.model ? "session override" : "configured";
@@ -106,6 +110,7 @@ function lspLine(snapshot: ReturnType<MainWatchdogRuntime["getSnapshot"]>): stri
 }
 
 export function buildWatchdogStatus(snapshot: ReturnType<MainWatchdogRuntime["getSnapshot"]>, ctx: ExtensionContext): string {
+	const modelConfigErrors = watchdogModelConfigErrors(snapshot, ctx);
 	const lines = [
 		"Subagent watchdog",
 		`Main: ${boolLabel(snapshot.enabled)}${!snapshot.config.enabled && snapshot.sessionOverride === undefined ? " (default off)" : ""}`,
@@ -132,6 +137,8 @@ export function buildWatchdogStatus(snapshot: ReturnType<MainWatchdogRuntime["ge
 	if (snapshot.lastError) lines.push(`Last error: ${snapshot.lastError}`);
 	if (!snapshot.configOk) {
 		lines.push("", "Config errors:", ...snapshot.errors.map((error) => `- ${error.message}`), "Watchdog is disabled until the config is fixed.");
+	} else if (modelConfigErrors.length > 0) {
+		lines.push("", "Model config error:", ...modelConfigErrors.map((error) => `- ${error}`), "Watchdog model review is blocked until the config is fixed.");
 	} else {
 		lines.push("", "Config: ok");
 	}
@@ -187,6 +194,31 @@ function resolveModelCommandValue(ctx: ExtensionCommandContext, raw: string): { 
 	};
 }
 
+function assertProspectivePersistentMainModelSupported(
+	ctx: ExtensionContext,
+	cwd: string,
+	value: { model?: string | null; thinking?: ThinkingLevel | false | null },
+	source: string,
+): void {
+	const target = readWatchdogPersistentTargetState({ scope: "user", cwd, target: { kind: "main" } });
+	const model = value.model === null ? target.inheritedModel : value.model ?? target.model;
+	const thinking = value.thinking === null ? target.inheritedThinking : value.thinking ?? target.thinking;
+	assertWatchdogConfigurationSupported(ctx, model, thinking, source, { allowCurrentModel: false });
+}
+
+function assertProspectiveSessionMainModelSupported(
+	ctx: ExtensionContext,
+	cwd: string,
+	value: { model: string | null; thinking: ThinkingLevel | false | null },
+	source: string,
+): void {
+	const persistent = resolveWatchdogConfig(cwd);
+	if (!persistent.ok) throw new Error(persistent.errors.map((error) => error.message).join("\n"));
+	const model = value.model === null ? persistent.config.main.model : value.model;
+	const thinking = value.model === null ? persistent.config.main.thinking : value.thinking ?? persistent.config.main.thinking;
+	assertWatchdogConfigurationSupported(ctx, model, thinking as ThinkingLevel | false | undefined, source);
+}
+
 function buildRecommendationText(ctx: ExtensionCommandContext): string {
 	const recommendation = recommendStrongWatchdogModel(ctx as ExtensionContext);
 	return [
@@ -208,6 +240,7 @@ function buildCheckText(runtime: MainWatchdogRuntime, ctx: ExtensionCommandConte
 	if (!snapshot.configOk) {
 		return ["Subagent watchdog config check", "", "Config errors:", ...snapshot.errors.map((error) => `- ${error.message}`)].join("\n");
 	}
+	assertWatchdogResolvedConfigurationSupported(ctx as ExtensionContext, snapshot.config, "/subagents-watchdog check");
 	const lines = ["Subagent watchdog config check", "", "Config: ok"];
 	if (snapshot.config.main.model) {
 		const resolved = resolveWatchdogModelInput(ctx as ExtensionContext, snapshot.config.main.model);
@@ -298,6 +331,7 @@ async function handleWatchdogCommand(
 		const rawModel = input.slice("session model ".length);
 		try {
 			const value = resolveModelCommandValue(ctx, rawModel);
+			assertProspectiveSessionMainModelSupported(ctx as ExtensionContext, ctx.cwd, value, "/subagents-watchdog session model");
 			const snapshot = value.model === null
 				? runtime.clearSessionModel(ctx.cwd)
 				: runtime.setSessionModel({ model: value.model, thinking: value.thinking ?? null }, ctx.cwd);
@@ -316,6 +350,7 @@ async function handleWatchdogCommand(
 		const rawModel = input.slice("model ".length);
 		try {
 			const value = resolveModelCommandValue(ctx, rawModel);
+			assertProspectivePersistentMainModelSupported(ctx as ExtensionContext, ctx.cwd, value, "/subagents-watchdog model");
 			const settingsPath = writeWatchdogModelSettings({
 				scope: "user",
 				target: { kind: "main" },
@@ -341,6 +376,7 @@ async function handleWatchdogCommand(
 		const rawThinking = input.slice("thinking ".length);
 		try {
 			const thinking = parseThinkingCommand(rawThinking);
+			assertProspectivePersistentMainModelSupported(ctx as ExtensionContext, ctx.cwd, { thinking }, "/subagents-watchdog thinking");
 			const settingsPath = writeWatchdogModelSettings({
 				scope: "user",
 				target: { kind: "main" },

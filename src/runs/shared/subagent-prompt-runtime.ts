@@ -1,5 +1,4 @@
 import * as fs from "node:fs";
-import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerNativeSupervisorClient } from "../../intercom/native-supervisor-channel.ts";
 import { consumeSteerRequestsFromDir, steerAckPathFromDir, writeSteerAckAt, writeSteerCapabilityAt, writeSteerRequestToDir, type SteerRequest } from "../background/control-channel.ts";
@@ -14,6 +13,7 @@ import {
 } from "./tool-availability.ts";
 import { TOOL_BUDGET_ENV, TOOL_BUDGET_ZERO_AUTH_ENV, decodeToolBudgetEnv, shouldBlockToolForBudget, toolBudgetBlockedMessage, toolBudgetSoftNudge } from "./tool-budget.ts";
 import type { JsonSchemaObject, ResolvedToolBudget, SubagentState } from "../../shared/types.ts";
+import { readPrivateArtifact, writeArtifact } from "../../shared/artifacts.ts";
 import { resolveCurrentSessionId } from "../../shared/session-identity.ts";
 import { resolveWatchPath } from "../../shared/utils.ts";
 import { registerChildWatchdog } from "../../watchdog/register-child.ts";
@@ -395,7 +395,7 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI): void {
 	const structuredOutputPath = process.env[STRUCTURED_OUTPUT_CAPTURE_ENV];
 	const structuredSchemaPath = process.env[STRUCTURED_OUTPUT_SCHEMA_ENV];
 	if (structuredOutputPath && structuredSchemaPath) {
-		const schema = JSON.parse(fs.readFileSync(structuredSchemaPath, "utf-8")) as JsonSchemaObject;
+		const schema = JSON.parse(readPrivateArtifact(structuredSchemaPath)) as JsonSchemaObject;
 		const parameters = createStructuredOutputToolParameters(schema);
 		const registerTool = pi.registerTool as unknown as (tool: {
 			name: string;
@@ -414,8 +414,7 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI): void {
 				if (validation.status === "invalid") {
 					throw new Error(`Structured output validation failed: ${validation.message}`);
 				}
-				fs.mkdirSync(path.dirname(structuredOutputPath), { recursive: true });
-				fs.writeFileSync(structuredOutputPath, JSON.stringify(params.value), { mode: 0o600 });
+				writeArtifact(structuredOutputPath, JSON.stringify(params.value));
 				return {
 					content: [{ type: "text", text: "Structured output captured." }],
 					details: { path: structuredOutputPath },

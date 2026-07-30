@@ -51,7 +51,7 @@ interface AsyncResultPayload {
 	wrapUpRequested?: boolean;
 	totalTokens?: { input: number; output: number; total: number };
 	totalCost?: { inputTokens: number; outputTokens: number; costUsd: number };
-	results: Array<{ agent?: string; launchContractDigest?: string; output?: string; success?: boolean; error?: string; protocolError?: { code?: string; stream?: string; limitBytes?: number; observedBytes?: number }; timedOut?: boolean; stopped?: boolean; turnBudget?: { maxTurns: number; graceTurns: number; outcome: string; turnCount: number; wrapUpRequestedAtTurn?: number; terminationDeferredAtTurn?: number; exceededAtTurn?: number }; turnBudgetExceeded?: boolean; wrapUpRequested?: boolean; model?: string; attemptedModels?: string[]; modelAttempts?: Array<{ success?: boolean; error?: string }>; totalCost?: { inputTokens: number; outputTokens: number; costUsd: number }; structuredOutput?: unknown; agentContract?: { version: 1 }; execution?: { status?: string; success?: boolean; exitCode?: number }; effects?: { fileMutation?: { status?: string; expected?: boolean; attempted?: boolean } }; intercomTarget?: string; acceptance?: { status?: string; effectiveAcceptance?: { level?: string }; childReport?: unknown; runtimeChecks?: Array<{ id?: string; status?: string; message?: string }> }; artifactPaths?: { outputPath?: string; inputPath?: string; metadataPath?: string }; capabilityCeiling?: { version?: number; allowedTools?: string[]; denyExtensions?: boolean; sources?: string[] }; capabilityAudit?: { effectiveTools?: string[]; removedTools?: string[]; extensionsDenied?: boolean } }>;
+	results: Array<{ agent?: string; launchContractDigest?: string; output?: string; success?: boolean; error?: string; protocolError?: { code?: string; stream?: string; limitBytes?: number; observedBytes?: number }; observedMutationAttempt?: boolean; timedOut?: boolean; stopped?: boolean; turnBudget?: { maxTurns: number; graceTurns: number; outcome: string; turnCount: number; wrapUpRequestedAtTurn?: number; terminationDeferredAtTurn?: number; exceededAtTurn?: number }; turnBudgetExceeded?: boolean; wrapUpRequested?: boolean; model?: string; attemptedModels?: string[]; modelAttempts?: Array<{ success?: boolean; error?: string }>; totalCost?: { inputTokens: number; outputTokens: number; costUsd: number }; structuredOutput?: unknown; agentContract?: { version: 1 }; execution?: { status?: string; success?: boolean; exitCode?: number }; effects?: { fileMutation?: { status?: string; expected?: boolean; attempted?: boolean } }; intercomTarget?: string; acceptance?: { status?: string; effectiveAcceptance?: { level?: string }; childReport?: unknown; runtimeChecks?: Array<{ id?: string; status?: string; message?: string }> }; artifactPaths?: { outputPath?: string; inputPath?: string; metadataPath?: string }; capabilityCeiling?: { version?: number; allowedTools?: string[]; denyExtensions?: boolean; sources?: string[] }; capabilityAudit?: { effectiveTools?: string[]; removedTools?: string[]; extensionsDenied?: boolean } }>;
 	outputs?: Record<string, { text?: string; structured?: unknown }>;
 	workflowGraph?: { nodes?: Array<{ kind?: string; label?: string; phase?: string; status?: string; acceptanceStatus?: string; error?: string; outputName?: string; structured?: boolean; children?: Array<{ label?: string; outputName?: string; itemKey?: string; status?: string; acceptanceStatus?: string; error?: string }> }> };
 	parallelHandoff?: { version?: number; path?: string; groupCount?: number; childCount?: number; changedPatches?: number; cleanupState?: string };
@@ -1290,6 +1290,48 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(payload.results[0]?.acceptance?.effectiveAcceptance.level, "attested");
 	});
 
+	it("fails closed when async runtime observes a mutation from a trusted read-only agent", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+		const acceptanceReport = [
+			"PASS",
+			"```acceptance-report",
+			JSON.stringify({
+				criteriaSatisfied: [{ id: "criterion-1", status: "satisfied", evidence: "review completed" }],
+				reviewFindings: ["no blockers"],
+				residualRisks: [],
+				notApplicableEvidence: ["changed-files", "tests-added"],
+			}),
+			"```",
+		].join("\n");
+		mockPi.onCall({
+			jsonl: [
+				events.toolStart("write", { path: "src/forbidden.ts" }),
+				events.toolEnd("write"),
+				events.assistantMessage(acceptanceReport),
+			],
+		});
+		const executor = makeAsyncExecutor([makeAgent("reviewer", {
+			tools: ["read", "grep", "find", "ls"],
+			acceptanceCapability: "read-only",
+			completionGuard: false,
+		} as never)]);
+
+		const result = await executor.execute(
+			"async-readonly-mutation-guard",
+			{ agent: "reviewer", task: "Review the patch without edits", async: true, clarify: false },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		const asyncId = result.details?.asyncId;
+		assert.ok(asyncId, "expected asyncId");
+		const payload = await readAsyncPayload(asyncId);
+		assert.equal(payload.success, false);
+		assert.equal(payload.results[0]?.observedMutationAttempt, true);
+		assert.equal(payload.results[0]?.acceptance?.status, "rejected");
+		assert.match(payload.results[0]?.error ?? "", /Read-only acceptance capability was violated/);
+	});
+
 	it("applies agent acceptance roles to inferred async parallel acceptance", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
 		mockPi.onCall({ output: "parallel exploration complete" });
 		const executor = makeAsyncExecutor([makeAgent("worker", { acceptanceRole: "read-only" })]);
@@ -1937,7 +1979,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.deepEqual(status.steps?.slice(1).map((step) => step.thinking), ["off", "off"]);
 	});
 
-	it("applies read-only acceptance roles to async dynamic children and their aggregate group", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+	it("preserves trusted read-only acceptance capability for materialized async dynamic children and their aggregate group", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		mockPi.onCall({ output: "targets", structuredOutput: { items: [{ path: "src/a.ts" }, { path: "src/b.ts" }] } });
 		const readOnlyReport = [
 			"done",
@@ -1950,6 +1992,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 				validationOutput: [],
 				reviewFindings: ["No blocking findings"],
 				residualRisks: [],
+				notApplicableEvidence: ["changed-files", "tests-added"],
 				noStagedFiles: true,
 			}),
 			"```",
@@ -1967,7 +2010,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 					concurrency: 1,
 				},
 			],
-			agents: [makeAgent("producer"), makeAgent("explorer", { acceptanceRole: "read-only" })],
+			agents: [makeAgent("producer"), makeAgent("explorer", { acceptanceRole: "read-only", acceptanceCapability: "read-only", tools: ["read"] } as never)],
 			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-dynamic-role" },
 			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
 			shareEnabled: false,
@@ -1978,6 +2021,10 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		const payload = await readAsyncPayload(id);
 		const explorerResults = payload.results.filter((child) => child.agent === "explorer");
 		assert.deepEqual(explorerResults.map((child) => child.acceptance?.effectiveAcceptance?.level), ["attested", "attested"]);
+		assert.deepEqual(
+			explorerResults.map((child) => (child.acceptance?.effectiveAcceptance as { context?: { capability?: string } } | undefined)?.context?.capability),
+			["read-only", "read-only"],
+		);
 		const dynamicNode = payload.workflowGraph?.nodes?.[1];
 		assert.equal(dynamicNode?.acceptanceStatus, "attested");
 		assert.deepEqual(dynamicNode?.children?.map((child) => child.acceptanceStatus), ["attested", "attested"]);
@@ -2486,6 +2533,99 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(mockPi.callCount(), 1);
 	});
 
+	it("propagates metadata-advertised max through async primary and fallback candidates", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({
+			jsonl: [{
+				type: "message_end",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "primary failed" }],
+					model: "test/metadata-primary",
+					errorMessage: "rate limit exceeded",
+					usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } },
+				},
+			}],
+			exitCode: 1,
+		});
+		mockPi.onCall({ output: "Recovered asynchronously" });
+		const id = `async-max-${Date.now().toString(36)}`;
+		const run = executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Do work",
+			agentConfig: makeAgent("worker", {
+				model: "test/metadata-primary",
+				fallbackModels: ["test/metadata-fallback"],
+				thinking: "max",
+			}),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			availableModels: [
+				{ provider: "test", id: "metadata-primary", fullId: "test/metadata-primary", thinkingLevelMap: { max: "max" } },
+				{ provider: "test", id: "metadata-fallback", fullId: "test/metadata-fallback", thinkingLevelMap: { max: "max" } },
+			],
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+		});
+
+		assert.equal(run.details.asyncId, id);
+		const payload = JSON.parse(fs.readFileSync(await waitForAsyncResultFile(id), "utf-8")) as AsyncResultPayload;
+		assert.equal(payload.success, true);
+		assert.deepEqual(payload.results[0]?.attemptedModels, ["test/metadata-primary:max", "test/metadata-fallback:max"]);
+		assert.equal(readMockPiArgs(mockPi, 0)[readMockPiArgs(mockPi, 0).indexOf("--model") + 1], "test/metadata-primary:max");
+		assert.equal(readMockPiArgs(mockPi, 1)[readMockPiArgs(mockPi, 1).indexOf("--model") + 1], "test/metadata-fallback:max");
+	});
+
+	it("rejects async max when any resolved fallback lacks max metadata", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, () => {
+		const id = `async-max-reject-${Date.now().toString(36)}`;
+		const run = executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Do work",
+			agentConfig: makeAgent("worker", {
+				model: "test/metadata-primary",
+				fallbackModels: ["test/legacy-fallback"],
+				thinking: "max",
+			}),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			availableModels: [
+				{ provider: "test", id: "metadata-primary", fullId: "test/metadata-primary", thinkingLevelMap: { max: "max" } },
+				{ provider: "test", id: "legacy-fallback", fullId: "test/legacy-fallback" },
+			],
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+		});
+		assert.equal(run.isError, true);
+		assert.match(run.content[0]?.text ?? "", /thinkingLevelMap\.max/);
+		assert.equal(fs.existsSync(path.join(ASYNC_DIR, id)), false);
+		assert.equal(mockPi.callCount(), 0);
+	});
+
+	it("rejects unsupported reserved dynamic async max before spawning", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, () => {
+		const id = `async-max-dynamic-reject-${Date.now().toString(36)}`;
+		const run = executeAsyncChain(id, {
+			chain: [
+				{ agent: "source", task: "Produce targets", as: "targets" },
+				{ expand: { from: { output: "targets", path: "/items" }, maxItems: 1 }, parallel: { agent: "worker", task: "Review {item.path}" }, collect: { as: "reviews" } },
+			],
+			agents: [makeAgent("source"), makeAgent("worker", { model: "test/metadata-primary", fallbackModels: ["test/legacy-fallback"], thinking: "high" })],
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			availableModels: [
+				{ provider: "test", id: "metadata-primary", fullId: "test/metadata-primary", thinkingLevelMap: { max: "max" } },
+				{ provider: "test", id: "legacy-fallback", fullId: "test/legacy-fallback" },
+			],
+			thinkingOverridesByFlatIndex: [undefined, "max"],
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+		});
+		assert.equal(run.isError, true);
+		assert.match(run.content[0]?.text ?? "", /thinkingLevelMap\.max/);
+		assert.equal(fs.existsSync(path.join(ASYNC_DIR, id)), false);
+		assert.equal(mockPi.callCount(), 0);
+	});
+
 	it("background single thinking override replaces primary and fallback suffixes", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		mockPi.onCall({
 			jsonl: [{
@@ -2863,6 +3003,95 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(payload.success, true);
 		assert.equal(fs.readFileSync(outputPath, "utf-8"), "async configured report");
 		assert.equal(fs.existsSync(path.join(tempDir, "context.md")), false);
+		if (process.platform !== "win32") {
+			assert.equal(fs.statSync(path.join(ASYNC_DIR, id)).mode & 0o777, 0o700);
+			assert.equal(fs.statSync(path.join(ASYNC_DIR, id, "status.json")).mode & 0o777, 0o600);
+			assert.equal(fs.statSync(resultPath).mode & 0o777, 0o600);
+			assert.equal(fs.statSync(outputPath).mode & 0o777, 0o600);
+		}
+	});
+
+	it("rejects runtime-owned output traversal before async launch and cleans the run directory", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, () => {
+		const id = `async-output-traversal-${Date.now().toString(36)}`;
+		const run = executeAsyncSingle(id, {
+			agent: "researcher",
+			task: "Write report",
+			agentConfig: makeAgent("researcher"),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: {
+				enabled: false,
+				includeInput: false,
+				includeOutput: false,
+				includeJsonl: false,
+				includeMetadata: false,
+				cleanupDays: 7,
+			},
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			output: "../victim.md",
+			outputBaseDir: path.join(tempDir, "runtime-owned-outputs", id),
+			maxSubagentDepth: 2,
+		});
+
+		assert.equal(run.isError, true);
+		assert.match(run.content[0]?.text ?? "", /Runtime-owned relative output path must not contain '\.\.'/);
+		assert.equal(mockPi.callCount(), 0);
+		assert.equal(fs.existsSync(path.join(ASYNC_DIR, id)), false);
+	});
+
+	it("cleans the allocated async directory when launch tool planning fails", () => {
+		const id = `async-tool-plan-cleanup-${Date.now().toString(36)}`;
+		writePackageSkill(tempDir, "cleanup-skill");
+		const run = executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Use the required skill",
+			agentConfig: makeAgent("worker", { skills: ["cleanup-skill"] }),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: {
+				enabled: false,
+				includeInput: false,
+				includeOutput: false,
+				includeJsonl: false,
+				includeMetadata: false,
+				cleanupDays: 7,
+			},
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+			capabilityCeiling: { version: 1, allowedTools: ["grep"], denyExtensions: false, sources: ["cleanup-test"] },
+		});
+
+		assert.equal(run.isError, true);
+		assert.match(run.content[0]?.text ?? "", /excludes required tool 'read'/);
+		assert.equal(mockPi.callCount(), 0);
+		assert.equal(fs.existsSync(path.join(ASYNC_DIR, id)), false);
+	});
+
+	it("cleans the allocated async directory when structured-output initialization fails", () => {
+		const id = `async-structured-output-cleanup-${Date.now().toString(36)}`;
+		const cyclicSchema: Record<string, unknown> = { type: "object" };
+		cyclicSchema.self = cyclicSchema;
+		const run = executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Return structured output",
+			agentConfig: makeAgent("worker"),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: {
+				enabled: false,
+				includeInput: false,
+				includeOutput: false,
+				includeJsonl: false,
+				includeMetadata: false,
+				cleanupDays: 7,
+			},
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+			structuredOutputSchema: cyclicSchema,
+		});
+
+		assert.equal(run.isError, true);
+		assert.match(run.content[0]?.text ?? "", /circular structure/i);
+		assert.equal(mockPi.callCount(), 0);
+		assert.equal(fs.existsSync(path.join(ASYNC_DIR, id)), false);
 	});
 
 	it("background single runs make output overrides authoritative in the child system prompt", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {

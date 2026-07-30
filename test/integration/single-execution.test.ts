@@ -90,6 +90,9 @@ interface RunSyncResult {
 	model?: string;
 	skills?: string[];
 	skillsWarning?: string;
+	preflight?: { resourceType?: string; resources?: string[]; message?: string };
+	resourceProvenance?: Array<{ name?: string; required?: boolean }>;
+	observedMutationAttempt?: boolean;
 	attemptedModels?: string[];
 	modelAttempts?: ModelAttempt[];
 	usage: { turns: number; input: number; output: number };
@@ -339,9 +342,17 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		initialSpawnState?: NonNullable<SubagentState["subagentSpawns"]>,
 		allowMutatingManagementActions = true,
 		initialAsyncJobs: SubagentState["asyncJobs"] = new Map(),
+		registeredToolNames?: string[],
 	) {
 		return createSubagentExecutor!({
-			pi: { events: createEventBus(), getSessionName: () => undefined },
+			pi: {
+				events: createEventBus(),
+				getSessionName: () => undefined,
+				...(registeredToolNames !== undefined ? {
+					getAllTools: () => registeredToolNames.map((name) => ({ name })),
+					getActiveTools: () => [...registeredToolNames],
+				} : {}),
+			},
 			state: {
 				baseCwd: tempDir,
 				currentSessionId: initialSpawnState?.sessionId ?? null,
@@ -1306,6 +1317,63 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(result.finalOutput, "Validation report after the patch");
 	});
 
+	it("does not apply the mutation completion guard to trusted read-only planners", async () => {
+		mockPi.onCall({ output: "Scoped implementation plan with ACs and a TDD gate" });
+		const agents = [makeAgent("stan-architect", {
+			tools: ["read", "grep", "find", "ls", "propose_memory"],
+			acceptanceCapability: "read-only",
+		} as never)];
+
+		const result = await runSync(tempDir, agents, "stan-architect", "Implement a narrow fix by creating a concise plan", {
+			runId: "guard-trusted-readonly-planner",
+			availableToolNames: ["read", "grep", "find", "ls", "propose_memory"],
+		});
+
+		assert.equal(result.exitCode, 0);
+		assert.equal(result.error, undefined);
+		assert.equal(result.finalOutput, "Scoped implementation plan with ACs and a TDD gate");
+	});
+
+	it("fails closed when runtime observes a mutation from a trusted read-only agent", async () => {
+		const acceptanceReport = [
+			"PASS",
+			"```acceptance-report",
+			JSON.stringify({
+				criteriaSatisfied: [{ id: "criterion-1", status: "satisfied", evidence: "review completed" }],
+				reviewFindings: ["no blockers"],
+				residualRisks: [],
+				notApplicableEvidence: ["changed-files", "tests-added"],
+			}),
+			"```",
+		].join("\n");
+		mockPi.onCall({
+			jsonl: [
+				events.toolStart("write", { path: "src/forbidden.ts" }),
+				events.toolEnd("write"),
+				events.assistantMessage(acceptanceReport),
+			],
+		});
+		const executor = makeExecutor([makeAgent("reviewer", {
+			tools: ["read", "grep", "find", "ls"],
+			acceptanceCapability: "read-only",
+			completionGuard: false,
+		} as never)]);
+
+		const result = await executor.execute(
+			"readonly-mutation-guard",
+			{ agent: "reviewer", task: "Review the patch without edits" },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		const child = result.details?.results?.[0] as RunSyncResult | undefined;
+		assert.equal(result.isError, true);
+		assert.equal(child?.observedMutationAttempt, true);
+		assert.equal(child?.acceptance?.status, "rejected");
+		assert.match(child?.error ?? "", /Read-only acceptance capability was violated/);
+	});
+
 	it("keeps bash-enabled implementation tasks conservative unless completion guard is disabled", async () => {
 		mockPi.onCall({ output: "cold start test after patch" });
 		mockPi.onCall({ output: "cold start test after patch" });
@@ -1732,6 +1800,55 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(mockPi.callCount(), 2);
 	});
 
+	it("propagates metadata-advertised max through foreground primary and fallback candidates", async () => {
+		mockPi.onCall({
+			jsonl: [{
+				type: "message_end",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "temporary provider failure" }],
+					model: "test/metadata-primary",
+					errorMessage: "rate limit exceeded",
+					usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } },
+				},
+			}],
+			exitCode: 1,
+		});
+		mockPi.onCall({ output: "Recovered on metadata-aware fallback" });
+		const result = await runSync(tempDir, [makeAgent("echo", {
+			model: "test/metadata-primary",
+			fallbackModels: ["test/metadata-fallback"],
+			thinking: "max",
+		})], "echo", "Task", {
+			availableModels: [
+				{ provider: "test", id: "metadata-primary", fullId: "test/metadata-primary", thinkingLevelMap: { max: "max" } },
+				{ provider: "test", id: "metadata-fallback", fullId: "test/metadata-fallback", thinkingLevelMap: { max: "max" } },
+			],
+			acceptance: false,
+		});
+
+		assert.equal(result.exitCode, 0);
+		assert.deepEqual(result.attemptedModels, ["test/metadata-primary:max", "test/metadata-fallback:max"]);
+	});
+
+	it("rejects foreground max when any resolved fallback lacks max metadata", async () => {
+		await assert.rejects(
+			() => runSync(tempDir, [makeAgent("echo", {
+				model: "test/metadata-primary",
+				fallbackModels: ["test/legacy-fallback"],
+				thinking: "max",
+			})], "echo", "Task", {
+				availableModels: [
+					{ provider: "test", id: "metadata-primary", fullId: "test/metadata-primary", thinkingLevelMap: { max: "max" } },
+					{ provider: "test", id: "legacy-fallback", fullId: "test/legacy-fallback" },
+				],
+				acceptance: false,
+			}),
+			/thinkingLevelMap\.max/,
+		);
+		assert.equal(mockPi.callCount(), 0);
+	});
+
 	it("retries with fallback models when provider errors exit zero", async () => {
 		mockPi.onCall({
 			jsonl: [{
@@ -2149,36 +2266,107 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.match(prompt, new RegExp(escapeRegExp(skillFile)));
 	});
 
-	it("injects Stan reviewer skills from a git-package manifest glob without warnings", async () => {
+	it("injects required Stan reviewer skills from a git-package manifest glob and fails closed on missing requirements", async () => {
 		const packageRoot = writeStanReviewerGitPackage(tempDir);
-		const agents = [makeAgent("stan-reviewer", { skills: STAN_REVIEWER_SKILLS })];
+		const agents = [makeAgent("stan-reviewer", { requiredSkills: STAN_REVIEWER_SKILLS })];
 		mockPi.onCall({ output: "Reviewed" });
-		mockPi.onCall({ output: "Reviewed with missing skill" });
 
 		const resolvedResult = await runSync(tempDir, agents, "stan-reviewer", "Review the change", {});
 		assert.equal(resolvedResult.exitCode, 0);
 		assert.deepEqual(resolvedResult.skills, STAN_REVIEWER_SKILLS);
 		assert.equal(resolvedResult.skillsWarning, undefined);
+		assert.equal(resolvedResult.resourceProvenance?.every((entry) => entry.required), true);
 
 		const systemPrompt = readCall().systemPrompts[0]?.text ?? "";
 		for (const skillName of STAN_REVIEWER_SKILLS) {
 			assert.match(systemPrompt, new RegExp(`<name>${escapeRegExp(skillName)}</name>`));
-			assert.match(
-				systemPrompt,
-				new RegExp(`<location>${escapeRegExp(path.join(packageRoot, ".pi", "skills", skillName, "SKILL.md"))}</location>`),
-			);
+			assert.match(systemPrompt, new RegExp(`<location>${escapeRegExp(path.join(packageRoot, ".pi", "skills", skillName, "SKILL.md"))}</location>`));
 		}
 
 		const missingResult = await runSync(
 			tempDir,
-			[makeAgent("stan-reviewer", { skills: [...STAN_REVIEWER_SKILLS, "truly-missing-skill"] })],
+			[makeAgent("stan-reviewer", { requiredSkills: [...STAN_REVIEWER_SKILLS, "truly-missing-skill"] })],
 			"stan-reviewer",
 			"Review the change",
 			{},
 		);
-		assert.equal(missingResult.exitCode, 0);
-		assert.deepEqual(missingResult.skills, STAN_REVIEWER_SKILLS);
-		assert.equal(missingResult.skillsWarning, "Skills not found: truly-missing-skill");
+		assert.equal(missingResult.exitCode, 1);
+		assert.equal(missingResult.preflight?.resourceType, "skill");
+		assert.deepEqual(missingResult.preflight?.resources, ["truly-missing-skill"]);
+		assert.match(missingResult.error ?? "", /Preflight failed for agent 'stan-reviewer'.*truly-missing-skill/);
+		assert.equal(mockPi.callCount(), 1, "required skill failure must happen before another model launch");
+	});
+
+	it("preflights explicit skills and required tools before model launch", async () => {
+		const explicitSkillResult = await runSync(tempDir, [makeAgent("worker")], "worker", "Run the focused task", { skills: ["missing-explicit-skill"] });
+		assert.equal(explicitSkillResult.exitCode, 1);
+		assert.equal(explicitSkillResult.preflight?.resourceType, "skill");
+		assert.match(explicitSkillResult.error ?? "", /worker.*missing-explicit-skill/);
+		assert.equal(mockPi.callCount(), 0);
+
+		const toolResult = await runSync(tempDir, [makeAgent("architect", { tools: ["read", "grep"], requiredTools: ["bash"] })], "architect", "Inspect the implementation", {});
+		assert.equal(toolResult.exitCode, 1);
+		assert.equal(toolResult.preflight?.resourceType, "tool");
+		assert.deepEqual(toolResult.preflight?.resources, ["bash"]);
+		assert.equal(mockPi.callCount(), 0);
+	});
+
+	it("preflights every static chain role before launching the first child", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const executor = makeExecutor([makeAgent("scout"), makeAgent("reviewer", { requiredSkills: ["missing-chain-role-skill"] })]);
+		const result = await executor.execute(
+			"preflight-chain",
+			{ chain: [{ agent: "scout", task: "Inspect the files" }, { agent: "reviewer", task: "Review the findings" }] },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+		assert.equal(result.isError, true);
+		assert.match(result.content[0]?.text ?? "", /reviewer.*missing-chain-role-skill/);
+		assert.equal(mockPi.callCount(), 0, "a later role preflight failure must block every chain model launch");
+	});
+
+	it("preserves reserved dynamic-fanout child indices in aggregate preflight failures", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const executor = makeExecutor([
+			makeAgent("scout"),
+			makeAgent("worker"),
+			makeAgent("reviewer", { requiredSkills: ["missing-after-dynamic-skill"] }),
+		]);
+		const result = await executor.execute(
+			"preflight-dynamic-index",
+			{
+				chain: [
+					{ agent: "scout", task: "Return targets", as: "targets", outputSchema: { type: "object" } },
+					{
+						expand: { from: { output: "targets", path: "/items" }, maxItems: 3 },
+						parallel: { agent: "worker", task: "Process item" },
+						collect: { as: "processed" },
+					},
+					{ agent: "reviewer", task: "Review the collected work" },
+				],
+			},
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+		assert.equal(result.isError, true);
+		assert.equal(result.details.results[0]?.index, 4, "scout is 0 and the dynamic template reserves indices 1..3");
+		assert.equal(mockPi.callCount(), 0);
+	});
+
+	it("allows required custom tools only when Pi's registry exposes them", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const requiredTool = "retrieve_project_state_snapshot";
+		const role = makeAgent("stan-reviewer", { tools: [requiredTool], requiredTools: [requiredTool] });
+		mockPi.onCall({ output: "Stan review complete" });
+		const availableExecutor = makeExecutor([role], {}, false, undefined, true, new Map(), [requiredTool]);
+		const availableResult = await availableExecutor.execute("registered-tool", { agent: "stan-reviewer", task: "Review" }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		assert.equal(availableResult.isError, undefined);
+		assert.equal(mockPi.callCount(), 1);
+
+		const missingExecutor = makeExecutor([role], {}, false, undefined, true, new Map(), []);
+		const missingResult = await missingExecutor.execute("missing-tool", { agent: "stan-reviewer", task: "Review" }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		assert.equal(missingResult.isError, true);
+		assert.match(missingResult.content[0]?.text ?? "", /retrieve_project_state_snapshot/);
+		assert.equal(mockPi.callCount(), 1);
 	});
 
 	it("falls back to the runtime cwd when the task cwd lacks a skill", async () => {
@@ -2201,18 +2389,20 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const result = await runSync(tempDir, agents, "worker", "Task", { skills: ["pi-subagents"] });
 
 		assert.equal(result.exitCode, 1);
-		assert.equal(result.error, "Skills not found: pi-subagents");
+		assert.match(result.error ?? "", /Preflight failed for agent 'worker'.*pi-subagents/);
+		assert.equal(result.preflight?.resourceType, "skill");
 		assert.equal(mockPi.callCount(), 0);
 	});
 
-	it("fails foreground runs when an agent default requests pi-subagents skill", async () => {
+	it("keeps a missing legacy agent skill best-effort", async () => {
 		const agents = [makeAgent("worker", { skills: ["pi-subagents"] })];
+		mockPi.onCall({ output: "Completed without the legacy skill" });
 
 		const result = await runSync(tempDir, agents, "worker", "Task", {});
 
-		assert.equal(result.exitCode, 1);
-		assert.equal(result.error, "Skills not found: pi-subagents");
-		assert.equal(mockPi.callCount(), 0);
+		assert.equal(result.exitCode, 0);
+		assert.equal(result.skillsWarning, "Legacy skills not found: pi-subagents");
+		assert.equal(mockPi.callCount(), 1);
 	});
 
 	it("writes artifacts when configured", async () => {

@@ -110,12 +110,19 @@ describe("watchdog model selection", () => {
 		assert.equal(resolved.thinking, "high");
 	});
 
-	it("accepts a max suffix for an authenticated watchdog model", () => {
-		const ctx = createCtx(
+	it("accepts max suffixes only when resolved model metadata advertises max", () => {
+		const supportedCtx = createCtx(
 			{ provider: "openai", id: "gpt-5" },
 			["openai/gpt-5"],
 			[{ provider: "openai", id: "gpt-5", reasoning: true, thinkingLevelMap: { max: "max" } }],
 		);
-		assert.equal(resolveWatchdogModelInput(ctx, "openai/gpt-5:max").thinking, "max");
+		assert.equal(resolveWatchdogModelInput(supportedCtx, "openai/gpt-5:max").thinking, "max");
+
+		const legacyCtx = createCtx(
+			{ provider: "openai", id: "gpt-5" },
+			["openai/gpt-5"],
+			[{ provider: "openai", id: "gpt-5", reasoning: true }],
+		);
+		assert.throws(() => resolveWatchdogModelInput(legacyCtx, "openai/gpt-5:max"), /thinkingLevelMap\.max/);
 	});
 });

@@ -22,7 +22,7 @@ export type SkillSource =
 	| "builtin"
 	| "unknown";
 
-interface ResolvedSkill {
+export interface ResolvedSkill {
 	name: string;
 	path: string;
 	content: string;

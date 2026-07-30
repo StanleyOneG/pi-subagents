@@ -6,6 +6,7 @@ export const KNOWN_FIELDS = new Set([
 	"package",
 	"description",
 	"tools",
+	"requiredTools",
 	"model",
 	"fallbackModels",
 	"thinking",
@@ -18,8 +19,11 @@ export const KNOWN_FIELDS = new Set([
 	"turnBudget",
 	"acceptance",
 	"acceptanceRole",
+	"acceptanceCapability",
 	"skill",
 	"skills",
+	"optionalSkills",
+	"requiredSkills",
 	"skillPath",
 	"extensions",
 	"subagentOnlyExtensions",
@@ -57,6 +61,8 @@ export function serializeAgent(config: AgentConfig, options: SerializeAgentOptio
 	];
 	const toolsValue = joinComma(tools);
 	if (toolsValue || preserve("tools")) lines.push(`tools: ${toolsValue ?? ""}`);
+	const requiredToolsValue = joinComma(config.requiredTools);
+	if (requiredToolsValue || preserve("requiredTools")) lines.push(`requiredTools: ${requiredToolsValue ?? ""}`);
 
 	if (config.model || preserve("model")) lines.push(`model: ${config.model ?? ""}`);
 	const fallbackModelsValue = joinComma(config.fallbackModels);
@@ -78,10 +84,15 @@ export function serializeAgent(config: AgentConfig, options: SerializeAgentOptio
 				? JSON.stringify(config.defaultAcceptance)
 				: String(config.defaultAcceptance)}`);
 	}
-	if (config.acceptanceRole || preserve("acceptanceRole")) lines.push(`acceptanceRole: ${config.acceptanceRole ?? ""}`);
+	if ((config.acceptanceRole && !config.acceptanceCapability) || preserve("acceptanceRole")) lines.push(`acceptanceRole: ${config.acceptanceRole ?? ""}`);
+	if (config.acceptanceCapability || preserve("acceptanceCapability")) lines.push(`acceptanceCapability: ${config.acceptanceCapability ?? ""}`);
 
 	const skillsValue = joinComma(config.skills);
 	if (skillsValue || preserve("skill", "skills")) lines.push(`skills: ${skillsValue ?? ""}`);
+	const optionalSkillsValue = joinComma(config.optionalSkills);
+	if (optionalSkillsValue || preserve("optionalSkills")) lines.push(`optionalSkills: ${optionalSkillsValue ?? ""}`);
+	const requiredSkillsValue = joinComma(config.requiredSkills);
+	if (requiredSkillsValue || preserve("requiredSkills")) lines.push(`requiredSkills: ${requiredSkillsValue ?? ""}`);
 	const skillPathValue = joinComma(config.skillPath);
 	if (skillPathValue || preserve("skillPath")) lines.push(`skillPath: ${skillPathValue ?? ""}`);
 

@@ -254,9 +254,13 @@ Direct settings example:
 
 Useful override fields: `model`, `fallbackModels`, `thinking`,
 `systemPromptMode`, `inheritProjectContext`, `inheritSkills`, `defaultContext`,
-`acceptanceRole`, `disabled`, `skills`, `tools`, `extensions`, and `systemPrompt`.
-Use `acceptanceRole: false` to clear an override. Create a user or project
-agent with the same name only when you want a substantially different agent.
+`acceptanceRole`, `acceptanceCapability`, `disabled`, `skills`, `optionalSkills`,
+`requiredSkills`, `requiredTools`, `skillPath`, `tools`, `extensions`, and
+`systemPrompt`. Use `false` to clear an optional override. `acceptanceRole` is
+only an inference hint; trusted `acceptanceCapability` must agree with it and
+may enforce read-only tools/evidence. Required resources fail preflight, while
+optional and legacy implicit skills warn. Create a user or project agent with
+the same name only when you want a substantially different agent.
 
 If a provider rejects model IDs with thinking suffixes, use
 `subagents.disableThinking: true` in user or project settings to clear bundled

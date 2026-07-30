@@ -51,7 +51,7 @@ export function splitKnownThinkingSuffix(model: string): { baseModel: string; th
 	};
 }
 
-export function findModelInfo(model: string | undefined, availableModels: ModelInfo[] | undefined, preferredProvider?: string): ModelInfo | undefined {
+export function findModelInfo(model: string | undefined, availableModels: readonly ModelInfo[] | undefined, preferredProvider?: string): ModelInfo | undefined {
 	if (!model || !availableModels || availableModels.length === 0) return undefined;
 	const { baseModel } = splitKnownThinkingSuffix(model);
 	const exact = availableModels.find((entry) => entry.fullId === baseModel);
@@ -74,8 +74,51 @@ export function getSupportedThinkingLevels(model: ModelInfo | undefined): Thinki
 	const levels = THINKING_LEVELS.filter((level) => {
 		const mapped = model.thinkingLevelMap?.[level];
 		if (mapped === null) return false;
+		// Preserve legacy fallback through xhigh; max is opt-in per model.
 		if (level === "xhigh" || level === "max") return mapped !== undefined;
 		return true;
 	});
 	return levels;
+}
+
+export function applyThinkingSuffix(model: string, thinking: string | false | undefined, replaceExisting?: boolean): string;
+export function applyThinkingSuffix(model: undefined, thinking: string | false | undefined, replaceExisting?: boolean): undefined;
+export function applyThinkingSuffix(model: string | undefined, thinking: string | false | undefined, replaceExisting?: boolean): string | undefined;
+export function applyThinkingSuffix(model: string | undefined, thinking: string | false | undefined, replaceExisting = false): string | undefined {
+	if (!model || !thinking) return model;
+	const colonIdx = model.lastIndexOf(":");
+	if (colonIdx !== -1 && (THINKING_LEVELS as readonly string[]).includes(model.substring(colonIdx + 1))) {
+		return replaceExisting ? `${model.slice(0, colonIdx)}:${thinking}` : model;
+	}
+	return `${model}:${thinking}`;
+}
+
+/** Reject max unless the resolved Pi registry entry explicitly advertises it. */
+export function assertMaxThinkingSuffixSupported(
+	model: string | undefined,
+	availableModels: readonly ModelInfo[] | undefined,
+	preferredProvider: string | undefined,
+	source: string,
+): void {
+	const { baseModel, thinkingSuffix } = splitKnownThinkingSuffix(model ?? "");
+	if (thinkingSuffix !== ":max") return;
+	const modelInfo = findModelInfo(model, availableModels, preferredProvider);
+	if (getSupportedThinkingLevels(modelInfo).includes("max")) return;
+	throw new Error(`${source} model '${baseModel}' does not support thinking 'max'; Pi model metadata must advertise thinkingLevelMap.max.`);
+}
+
+export function applyMetadataGatedThinkingSuffix(model: string, thinking: string | false | undefined, replaceExisting: boolean, availableModels: readonly ModelInfo[] | undefined, preferredProvider: string | undefined, source: string): string;
+export function applyMetadataGatedThinkingSuffix(model: undefined, thinking: string | false | undefined, replaceExisting: boolean, availableModels: readonly ModelInfo[] | undefined, preferredProvider: string | undefined, source: string): undefined;
+export function applyMetadataGatedThinkingSuffix(model: string | undefined, thinking: string | false | undefined, replaceExisting: boolean, availableModels: readonly ModelInfo[] | undefined, preferredProvider: string | undefined, source: string): string | undefined;
+export function applyMetadataGatedThinkingSuffix(
+	model: string | undefined,
+	thinking: string | false | undefined,
+	replaceExisting: boolean,
+	availableModels: readonly ModelInfo[] | undefined,
+	preferredProvider: string | undefined,
+	source: string,
+): string | undefined {
+	const result = applyThinkingSuffix(model, thinking, replaceExisting);
+	assertMaxThinkingSuffixSupported(result, availableModels, preferredProvider, source);
+	return result;
 }

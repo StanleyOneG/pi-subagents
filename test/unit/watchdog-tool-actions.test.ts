@@ -12,8 +12,15 @@ const originalHome = process.env.HOME;
 const originalUserProfile = process.env.USERPROFILE;
 const originalPiCodingAgentDir = process.env.PI_CODING_AGENT_DIR;
 
-function createCtx(current: { provider: string; id: string }) {
-	const models = [
+interface TestModel {
+	provider: string;
+	id: string;
+	reasoning: boolean;
+	thinkingLevelMap?: Record<string, string | null>;
+}
+
+function createCtx(current: { provider: string; id: string }, availableModels?: TestModel[]) {
+	const models = availableModels ?? [
 		{ provider: "openai-codex", id: "gpt-5.5", reasoning: true },
 		{ provider: "anthropic", id: "claude-opus-4-8", reasoning: true },
 	];
@@ -87,5 +94,68 @@ describe("watchdog tool actions", () => {
 		const settings = JSON.parse(fs.readFileSync(path.join(tempHome, ".pi", "agent", "settings.json"), "utf-8"));
 		assert.equal(settings.subagents.watchdog.main.model, "openai-codex/gpt-5.5");
 		assert.equal(settings.subagents.watchdog.main.thinking, "high");
+	});
+
+	it("accepts explicit max configuration only for metadata-advertised models", () => {
+		const runtime = new MainWatchdogRuntime({ cwd: tempProject });
+		const legacy = { provider: "test", id: "legacy", reasoning: true };
+		const rejected = handleWatchdogToolAction(
+			"watchdog.configure",
+			{ model: "test/legacy", thinking: "max" },
+			createCtx({ provider: "test", id: "legacy" }, [legacy]),
+			runtime,
+		);
+		assert.equal(rejected.isError, true);
+		assert.match(text(rejected), /thinkingLevelMap\.max/);
+
+		const supported = { provider: "test", id: "metadata-max", reasoning: true, thinkingLevelMap: { max: "max" } };
+		const accepted = handleWatchdogToolAction(
+			"watchdog.configure",
+			{ model: "test/metadata-max", thinking: "max" },
+			createCtx({ provider: "test", id: "metadata-max" }, [supported]),
+			runtime,
+		);
+		assert.equal(accepted.isError, undefined);
+		assert.equal(runtime.getSnapshot(tempProject).config.main.thinking, "max");
+	});
+
+	it("rejects clearing a session override when it would reveal unsupported persisted max", () => {
+		const settingsPath = path.join(tempHome, ".pi", "agent", "settings.json");
+		fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+		fs.writeFileSync(settingsPath, JSON.stringify({
+			subagents: { watchdog: { main: { model: "test/legacy", thinking: "max" } } },
+		}), "utf-8");
+		const supported = { provider: "test", id: "metadata-max", reasoning: true, thinkingLevelMap: { max: "max" } };
+		const legacy = { provider: "test", id: "legacy", reasoning: true };
+		const ctx = createCtx({ provider: "test", id: "metadata-max" }, [supported, legacy]);
+		const runtime = new MainWatchdogRuntime({ cwd: tempProject });
+
+		const override = handleWatchdogToolAction("watchdog.configure", { model: "test/metadata-max", thinking: "low" }, ctx, runtime);
+		assert.equal(override.isError, undefined);
+		const rejected = handleWatchdogToolAction("watchdog.configure", { model: "inherit" }, ctx, runtime);
+		assert.equal(rejected.isError, true);
+		assert.match(text(rejected), /thinkingLevelMap\.max/);
+		assert.equal(runtime.getSnapshot(tempProject).config.main.model, "test/metadata-max");
+		assert.equal(runtime.getSnapshot(tempProject).config.main.thinking, "low");
+	});
+
+	it("rejects model changes that would leave saved max attached to an unsupported model", () => {
+		const supported = { provider: "test", id: "metadata-max", reasoning: true, thinkingLevelMap: { max: "max" } };
+		const legacy = { provider: "test", id: "legacy", reasoning: true };
+		const ctx = createCtx({ provider: "test", id: "metadata-max" }, [supported, legacy]);
+		const runtime = new MainWatchdogRuntime({ cwd: tempProject });
+
+		const initial = handleWatchdogToolAction("watchdog.configure", { scope: "user", model: "test/metadata-max", thinking: "max" }, ctx, runtime);
+		assert.equal(initial.isError, undefined);
+		const rejected = handleWatchdogToolAction("watchdog.configure", { scope: "user", model: "test/legacy" }, ctx, runtime);
+		assert.equal(rejected.isError, true);
+		assert.match(text(rejected), /thinkingLevelMap\.max/);
+		const settings = JSON.parse(fs.readFileSync(path.join(tempHome, ".pi", "agent", "settings.json"), "utf-8"));
+		assert.equal(settings.subagents.watchdog.main.model, "test/metadata-max");
+		assert.equal(settings.subagents.watchdog.main.thinking, "max");
+
+		const unresolvedChildren = handleWatchdogToolAction("watchdog.configure", { scope: "user", target: "children", thinking: "max" }, ctx, runtime);
+		assert.equal(unresolvedChildren.isError, true);
+		assert.match(text(unresolvedChildren), /explicit max-capable model/);
 	});
 });

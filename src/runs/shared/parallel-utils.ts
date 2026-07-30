@@ -29,7 +29,11 @@ export interface RunnerSubagentStep {
 	inheritProjectContext: boolean;
 	inheritSkills: boolean;
 	skills?: string[];
+	skillsWarning?: string;
+	resourceProvenance?: import("../../shared/types.ts").ResourceSkillProvenance[];
 	outputPath?: string;
+	/** Runtime-owned root for private relative-output I/O. */
+	outputPrivateRoot?: string;
 	/** Defer the authoritative output instruction until a dynamic fanout item is materialized. */
 	namespaceOutputPath?: boolean;
 	outputMode?: "inline" | "file-only";
@@ -49,6 +53,7 @@ export interface RunnerSubagentStep {
 	effectiveAcceptance?: import("../../shared/types.ts").ResolvedAcceptanceConfig;
 	acceptanceInput?: import("../../shared/types.ts").AcceptanceInput;
 	acceptanceRole?: import("../../shared/types.ts").AcceptanceRole;
+	acceptanceCapability?: import("../../shared/types.ts").AcceptancePolicyContext["capability"];
 	gateOn?: import("../../shared/types.ts").ChainGateLayer;
 	toolBudget?: import("../../shared/types.ts").ResolvedToolBudget;
 	capabilityCeiling?: import("./capability-ceiling.ts").ResolvedSubagentCapabilityCeiling;
@@ -75,6 +80,7 @@ export interface DynamicRunnerGroup {
 	effectiveAcceptance?: import("../../shared/types.ts").ResolvedAcceptanceConfig;
 	acceptanceInput?: import("../../shared/types.ts").AcceptanceInput;
 	acceptanceRole?: import("../../shared/types.ts").AcceptanceRole;
+	acceptanceCapability?: import("../../shared/types.ts").AcceptancePolicyContext["capability"];
 	agentContract?: import("../../shared/types.ts").AgentContract;
 	gateOn?: import("../../shared/types.ts").ChainGateLayer;
 }

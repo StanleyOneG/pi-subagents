@@ -252,6 +252,45 @@ Project prompt.
 		assert.equal(invalidArtifactDir.code, "invalid_artifact_dir");
 	});
 
+	it("fails closed when direct launch max is not advertised by every candidate", async () => {
+		const cwd = path.join(tempDir, "repo");
+		fs.mkdirSync(cwd, { recursive: true });
+		writeAgent(path.join(cwd, ".pi", "agents", "worker.md"), `---
+name: worker
+description: Metadata-gated worker
+model: test/primary
+fallbackModels:
+  - test/fallback
+thinking: max
+---
+Project prompt.
+`);
+
+		const rejected = await resolveSubagentLaunchContract({
+			agent: "worker",
+			cwd,
+			availableModels: [
+				{ provider: "test", id: "primary", fullId: "test/primary", thinkingLevelMap: { max: "max" } },
+				{ provider: "test", id: "fallback", fullId: "test/fallback" },
+			],
+		});
+		assert.equal(rejected.ok, false);
+		assert.equal(rejected.code, "unsupported_thinking");
+		assert.match(rejected.message, /thinkingLevelMap\.max/);
+
+		const accepted = await resolveSubagentLaunchContract({
+			agent: "worker",
+			cwd,
+			availableModels: [
+				{ provider: "test", id: "primary", fullId: "test/primary", thinkingLevelMap: { max: "max" } },
+				{ provider: "test", id: "fallback", fullId: "test/fallback", thinkingLevelMap: { max: "max" } },
+			],
+		});
+		assert.equal(accepted.ok, true);
+		assert.equal(accepted.contract.model, "test/primary:max");
+		assert.deepEqual(accepted.contract.modelCandidates, ["test/primary:max", "test/fallback:max"]);
+	});
+
 	it("projects MCP, extension, fanout, structured-output, and fork diagnostics", async () => {
 		const cwd = path.join(tempDir, "repo");
 		fs.mkdirSync(cwd, { recursive: true });

@@ -98,18 +98,26 @@ That is only a starting point. Omit `package` for the traditional unqualified ru
 - `fallbackModels`
 - `subagentOnlyExtensions`
 - `skills`
+- `optionalSkills`
+- `requiredSkills`
+- `requiredTools`
 - `skillPath`
 - `memory`
 - `maxSubagentDepth`
 - `acceptance`
 - `acceptanceRole`
+- `acceptanceCapability`
 - `async` — single-agent default for background launch (`true`/`false`); explicit tool-call `async` wins
 - `timeoutMs` — single-agent default run-level max runtime in ms; foreground calls use a 30-minute package default only when neither the call nor agent provides one (tool alias `maxRuntimeMs` is also accepted)
 - `turnBudget` — single-agent default `{ maxTurns, graceTurns? }` JSON object
 
 `acceptance` is a single-agent launch default. Use a scalar level such as `checked` or an inline/block YAML map such as `{ level: "none", reason: "lightweight lookup" }`. An explicit tool-call value wins; chain and parallel acceptance remains configured on the task or step. Management create/update accepts the same policy object, and `acceptance: ""` clears the frontmatter default (`false` remains the deprecated disabled-policy shorthand).
 
-`acceptanceRole` is `read-only` or `writer` and controls automatic acceptance inference only. Explicit task mutation or no-edit intent wins; otherwise the role replaces agent-name guessing. Omission preserves the current name heuristics. The field does not grant or revoke tools. Management accepts `false` or an empty string to clear it.
+`acceptanceRole` is `read-only` or `writer` and controls automatic acceptance inference only. Explicit task mutation or no-edit intent wins; otherwise the role replaces agent-name guessing. Omission preserves the current name heuristics. The field does not grant or revoke tools.
+
+`acceptanceCapability` is trusted role-card metadata (`read-only` or `mutating`) and must agree with `acceptanceRole`. Read-only capability requires an explicit allowlist without `write`, `edit`, or unrestricted `bash`; it also controls read-only acceptance exemptions and completion-guard behavior. Management accepts `false` or an empty string to clear either field.
+
+`requiredSkills` and explicit per-run skill selections fail preflight when unavailable. `optionalSkills` and legacy implicit `skills` remain best effort and warn. `requiredTools` must be both role-allowlisted and available in Pi's configured/active registry.
 
 `tools` is a strict child allowlist, not an extension loader. For a named extension tool, keep its registered name in `tools` and load its provider through normal Pi discovery, `extensions`, a path-like `tools` entry, or `subagentOnlyExtensions`. For example, pair `tools: read, fixture_search` with `subagentOnlyExtensions: ./tools/fixture-search.ts` when the provider should exist only in that agent's child sessions. The child now fails with the unavailable names and provider-loading guidance instead of silently continuing when a requested tool is absent; internal `structured_output` is allowed automatically when an output schema requires it.
 

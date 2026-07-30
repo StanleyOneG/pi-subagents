@@ -8,6 +8,7 @@ import {
 	type ModelInfo,
 	type ThinkingLevel,
 } from "../shared/model-info.ts";
+import type { ResolvedWatchdogConfig } from "./types.ts";
 
 export const STRONG_WATCHDOG_THINKING: ThinkingLevel = "high";
 
@@ -76,6 +77,58 @@ export function parseWatchdogThinkingInput(value: string | false | undefined, so
 	return assertSupportedThinking(value, source);
 }
 
+/** Max is accepted only when the active Pi model registry explicitly advertises it. */
+export function assertWatchdogThinkingSupported(model: ModelInfo, thinking: ThinkingLevel, source: string): ThinkingLevel {
+	if (thinking !== "max" || getSupportedThinkingLevels(model).includes("max")) return thinking;
+	throw new Error(`Watchdog model '${model.fullId}' does not support thinking '${thinking}' from ${source}; Pi model metadata must advertise thinkingLevelMap.max.`);
+}
+
+export function assertWatchdogConfigurationSupported(
+	ctx: ExtensionContext,
+	model: string | undefined,
+	thinking: ThinkingLevel | false | undefined,
+	source: string,
+	options: { allowCurrentModel?: boolean } = {},
+): void {
+	const resolved = model ? resolveWatchdogModelInput(ctx, model) : undefined;
+	const effectiveThinking = resolved?.thinking ?? thinking;
+	if (effectiveThinking !== "max") return;
+	const currentModel = resolved?.registryModel ?? (options.allowCurrentModel === false ? undefined : ctx.model);
+	if (!currentModel) {
+		const requirement = options.allowCurrentModel === false
+			? "requires an explicit max-capable model."
+			: "requires a resolved model with thinkingLevelMap.max metadata.";
+		throw new Error(`Watchdog thinking 'max' from ${source} ${requirement}`);
+	}
+	assertWatchdogThinkingSupported(toModelInfo(currentModel), effectiveThinking, source);
+}
+
+export function watchdogConfigurationValidationErrors(
+	ctx: ExtensionContext,
+	config: ResolvedWatchdogConfig,
+	source: string,
+): string[] {
+	const errors: string[] = [];
+	const validate = (label: string, model: string | undefined, thinking: string | false | undefined, allowCurrentModel: boolean): void => {
+		try {
+			assertWatchdogConfigurationSupported(ctx, model, thinking as ThinkingLevel | false | undefined, `${source} ${label}`, { allowCurrentModel });
+		} catch (error) {
+			errors.push(`${label}: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	};
+	validate("main", config.main.model, config.main.thinking, true);
+	validate("children", config.children.model, config.children.thinking, false);
+	for (const [agent, override] of Object.entries(config.children.overrides)) {
+		validate(`child '${agent}'`, override.model ?? config.children.model, override.thinking ?? config.children.thinking, false);
+	}
+	return errors;
+}
+
+export function assertWatchdogResolvedConfigurationSupported(ctx: ExtensionContext, config: ResolvedWatchdogConfig, source: string): void {
+	const errors = watchdogConfigurationValidationErrors(ctx, config, source);
+	if (errors.length > 0) throw new Error(errors.join("\n"));
+}
+
 export function resolveWatchdogModelInput(ctx: ExtensionContext, rawModel: string): ResolvedWatchdogModelInput {
 	const trimmed = rawModel.trim();
 	if (!trimmed) throw new Error("Watchdog model must be a non-empty provider/model value.");
@@ -90,9 +143,13 @@ export function resolveWatchdogModelInput(ctx: ExtensionContext, rawModel: strin
 	if (!ctx.modelRegistry.hasConfiguredAuth(registryModel)) {
 		throw new Error(`Watchdog model '${baseModel}' is not authenticated. Configure credentials for provider '${named.provider}' or choose an authenticated model.`);
 	}
+	const modelInfo = toModelInfo(registryModel);
+	const thinking = thinkingSuffix
+		? assertWatchdogThinkingSupported(modelInfo, assertSupportedThinking(thinkingSuffix.slice(1), "watchdog model suffix"), "watchdog model suffix")
+		: undefined;
 	return {
 		model: `${named.provider}/${named.id}`,
-		...(thinkingSuffix ? { thinking: assertSupportedThinking(thinkingSuffix.slice(1), "watchdog model suffix") } : {}),
+		...(thinking ? { thinking } : {}),
 		registryModel,
 	};
 }

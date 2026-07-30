@@ -26,7 +26,8 @@ import {
 	SUBAGENT_PARENT_ROOT_RUN_ID_ENV,
 	SUBAGENT_PARENT_RUN_ID_ENV,
 } from "./pi-args.ts";
-import { writeAtomicJson } from "../../shared/atomic-json.ts";
+import { writePrivateAtomicJson as writeAtomicJson } from "../../shared/atomic-json.ts";
+import { ensurePrivateDirectory, readPrivateArtifact, writeArtifact } from "../../shared/artifacts.ts";
 import { sanitizeProcessTerminal } from "../background/process-terminal.ts";
 
 export const NESTED_EVENTS_DIR = path.join(TEMP_ROOT_DIR, "nested-subagent-events");
@@ -117,9 +118,9 @@ export function createNestedRoute(rootRunId: string): NestedRoute {
 	const routeRoot = path.join(NESTED_EVENTS_DIR, `${rootRunId}-${capabilityToken}`);
 	const eventSink = path.join(routeRoot, "events");
 	const controlInbox = path.join(routeRoot, "controls");
-	fs.mkdirSync(eventSink, { recursive: true, mode: 0o700 });
-	fs.mkdirSync(controlInbox, { recursive: true, mode: 0o700 });
-	fs.writeFileSync(path.join(routeRoot, ROUTE_FILE), `${JSON.stringify({ rootRunId, capabilityToken, createdAt: Date.now() })}\n`, { mode: 0o600 });
+	ensurePrivateDirectory(eventSink);
+	ensurePrivateDirectory(controlInbox);
+	writeArtifact(path.join(routeRoot, ROUTE_FILE), `${JSON.stringify({ rootRunId, capabilityToken, createdAt: Date.now() })}\n`);
 	return { rootRunId, eventSink, controlInbox, capabilityToken };
 }
 
@@ -132,7 +133,7 @@ export function resolveNestedRouteFromEnv(env: NodeJS.ProcessEnv = process.env):
 	const route = { rootRunId, eventSink, controlInbox, capabilityToken };
 	validateRouteShape(route);
 	const routeFile = path.join(commonRouteRoot(route), ROUTE_FILE);
-	const metadata = JSON.parse(fs.readFileSync(routeFile, "utf-8")) as { rootRunId?: unknown; capabilityToken?: unknown };
+	const metadata = JSON.parse(readPrivateArtifact(routeFile)) as { rootRunId?: unknown; capabilityToken?: unknown };
 	if (metadata.rootRunId !== rootRunId || metadata.capabilityToken !== capabilityToken) {
 		throw new Error("Nested event route metadata does not match the provided root id and capability token.");
 	}
@@ -658,11 +659,11 @@ export function projectNestedEvents(route: NestedRoute): NestedRegistry {
 function writeRouteRecord(dir: string, ts: number, payload: object): string {
 	const content = `${JSON.stringify(payload)}\n`;
 	if (Buffer.byteLength(content, "utf-8") > MAX_EVENT_BYTES) throw new Error("Nested route record exceeds the maximum size.");
-	fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+	ensurePrivateDirectory(dir);
 	const name = `${String(ts).padStart(13, "0")}-${randomUUID()}.json`;
 	const tmp = path.join(dir, `.${name}.tmp`);
 	const finalPath = path.join(dir, name);
-	fs.writeFileSync(tmp, content, { mode: 0o600 });
+	writeArtifact(tmp, content);
 	fs.renameSync(tmp, finalPath);
 	return finalPath;
 }

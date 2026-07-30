@@ -223,8 +223,11 @@ export function editableAgentConfig(agent: AgentConfig): AgentConfig {
 		disabled: base.disabled,
 		systemPrompt: base.systemPrompt,
 		skills: base.skills ? [...base.skills] : undefined,
+		optionalSkills: base.optionalSkills ? [...base.optionalSkills] : undefined,
+		requiredSkills: base.requiredSkills ? [...base.requiredSkills] : undefined,
 		skillPath: base.skillPath ? [...base.skillPath] : undefined,
 		tools: base.tools ? [...base.tools] : undefined,
+		requiredTools: base.requiredTools ? [...base.requiredTools] : undefined,
 		mcpDirectTools: base.mcpDirectTools ? [...base.mcpDirectTools] : undefined,
 		extensions: base.extensions ? [...base.extensions] : undefined,
 		subagentOnlyExtensions: base.subagentOnlyExtensions ? [...base.subagentOnlyExtensions] : undefined,
@@ -255,7 +258,10 @@ export function preservedAgentFrontmatterFields(agent: AgentConfig, cfg: Record<
 	if (hasKey(cfg, "model")) changed("model");
 	if (hasKey(cfg, "fallbackModels")) changed("fallbackModels");
 	if (hasKey(cfg, "tools")) changed("tools");
+	if (hasKey(cfg, "requiredTools")) changed("requiredTools");
 	if (hasKey(cfg, "skills")) changed("skill", "skills");
+	if (hasKey(cfg, "optionalSkills")) changed("optionalSkills");
+	if (hasKey(cfg, "requiredSkills")) changed("requiredSkills");
 	if (hasKey(cfg, "skillPath")) changed("skillPath");
 	if (hasKey(cfg, "extensions")) changed("extensions");
 	if (hasKey(cfg, "subagentOnlyExtensions")) changed("subagentOnlyExtensions");
@@ -281,6 +287,7 @@ export function preservedAgentFrontmatterFields(agent: AgentConfig, cfg: Record<
 	if (hasKey(cfg, "turnBudget")) changed("turnBudget");
 	if (hasKey(cfg, "acceptance")) changed("acceptance");
 	if (hasKey(cfg, "acceptanceRole")) changed("acceptanceRole");
+	if (hasKey(cfg, "acceptanceCapability")) changed("acceptanceCapability");
 	if (hasKey(cfg, "output")) changed("output");
 	if (hasKey(cfg, "reads")) changed("defaultReads");
 	if (hasKey(cfg, "progress")) changed("defaultProgress");
@@ -403,6 +410,26 @@ function applyAgentConfig(target: AgentConfig, cfg: Record<string, unknown>): st
 		else if (typeof cfg.skills === "string") { const skills = parseCsv(cfg.skills); target.skills = skills.length ? skills : undefined; }
 		else return "config.skills must be a comma-separated string or false when provided.";
 	}
+	if (hasKey(cfg, "optionalSkills")) {
+		if (cfg.optionalSkills === false || cfg.optionalSkills === "") target.optionalSkills = undefined;
+		else if (typeof cfg.optionalSkills === "string") { const skills = parseCsv(cfg.optionalSkills); target.optionalSkills = skills.length ? skills : undefined; }
+		else return "config.optionalSkills must be a comma-separated string or false when provided.";
+	}
+	if (hasKey(cfg, "requiredSkills")) {
+		if (cfg.requiredSkills === false || cfg.requiredSkills === "") target.requiredSkills = undefined;
+		else if (typeof cfg.requiredSkills === "string") { const skills = parseCsv(cfg.requiredSkills); target.requiredSkills = skills.length ? skills : undefined; }
+		else return "config.requiredSkills must be a comma-separated string or false when provided.";
+	}
+	if (hasKey(cfg, "requiredTools")) {
+		if (cfg.requiredTools === false || cfg.requiredTools === "") target.requiredTools = undefined;
+		else if (typeof cfg.requiredTools === "string") { const tools = parseCsv(cfg.requiredTools); target.requiredTools = tools.length ? tools : undefined; }
+		else return "config.requiredTools must be a comma-separated string or false when provided.";
+	}
+	if (hasKey(cfg, "acceptanceCapability")) {
+		if (cfg.acceptanceCapability === false || cfg.acceptanceCapability === "") target.acceptanceCapability = undefined;
+		else if (cfg.acceptanceCapability === "read-only" || cfg.acceptanceCapability === "mutating") target.acceptanceCapability = cfg.acceptanceCapability;
+		else return "config.acceptanceCapability must be 'read-only', 'mutating', or false when provided.";
+	}
 	if (hasKey(cfg, "skillPath")) {
 		if (cfg.skillPath === false || cfg.skillPath === "") target.skillPath = undefined;
 		else if (typeof cfg.skillPath === "string") { const skillPath = parseCsv(cfg.skillPath); target.skillPath = skillPath.length ? skillPath : undefined; }
@@ -475,6 +502,13 @@ function applyAgentConfig(target: AgentConfig, cfg: Record<string, unknown>): st
 		if (cfg.acceptanceRole === false || cfg.acceptanceRole === "") target.acceptanceRole = undefined;
 		else if (cfg.acceptanceRole === "read-only" || cfg.acceptanceRole === "writer") target.acceptanceRole = cfg.acceptanceRole;
 		else return "config.acceptanceRole must be 'read-only', 'writer', or false when provided.";
+	}
+	if (target.acceptanceCapability) {
+		const mappedRole = target.acceptanceCapability === "read-only" ? "read-only" : "writer";
+		if (hasKey(cfg, "acceptanceRole") && target.acceptanceRole !== undefined && target.acceptanceRole !== mappedRole) {
+			return "config.acceptanceCapability conflicts with config.acceptanceRole.";
+		}
+		target.acceptanceRole = mappedRole;
 	}
 	if (hasKey(cfg, "output")) {
 		if (cfg.output === false || cfg.output === "") target.output = undefined;
@@ -567,8 +601,12 @@ function formatAgentDetail(agent: AgentConfig): string {
 	if (agent.model) lines.push(`Model: ${agent.model}`);
 	if (agent.fallbackModels?.length) lines.push(`Fallback models: ${agent.fallbackModels.join(", ")}`);
 	if (tools.length) lines.push(`Tools: ${tools.join(", ")}`);
-	if (agent.skills?.length) lines.push(`Skills: ${agent.skills.join(", ")}`);
+	if (agent.requiredTools?.length) lines.push(`Required tools (preflight): ${agent.requiredTools.join(", ")}`);
+	if (agent.requiredSkills?.length) lines.push(`Required skills (preflight): ${agent.requiredSkills.join(", ")}`);
+	if (agent.skills?.length) lines.push(`Legacy best-effort skills: ${agent.skills.join(", ")}`);
+	if (agent.optionalSkills?.length) lines.push(`Optional skills: ${agent.optionalSkills.join(", ")}`);
 	if (agent.skillPath?.length) lines.push(`Skill paths: ${agent.skillPath.join(", ")}`);
+	if (agent.acceptanceCapability) lines.push(`Acceptance capability: ${agent.acceptanceCapability}`);
 	lines.push(`System prompt mode: ${agent.systemPromptMode}`);
 	lines.push(`Inherit project context: ${agent.inheritProjectContext ? "true" : "false"}`);
 	lines.push(`Inherit skills: ${agent.inheritSkills ? "true" : "false"}`);

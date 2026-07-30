@@ -401,6 +401,45 @@ Inspect
 		assert.match(readText(invalid), /config\.acceptanceRole must be 'read-only', 'writer', or false/);
 	});
 
+	it("preserves Stan resource contracts through management updates", () => {
+		const ctx = { cwd: tempDir, modelRegistry: { getAvailable: () => [] } };
+		const created = handleCreate({ config: {
+			name: "stan-role",
+			description: "Stan role",
+			scope: "project",
+			tools: "read, grep, find, ls",
+			requiredTools: "read, grep",
+			requiredSkills: "load-project-state, review-plan",
+			optionalSkills: "codeguard",
+			acceptanceCapability: "read-only",
+		} }, ctx);
+		assert.equal(created.isError, false, readText(created));
+
+		const filePath = path.join(tempDir, ".pi", "agents", "stan-role.md");
+		const createdContent = fs.readFileSync(filePath, "utf-8");
+		assert.match(createdContent, /^requiredTools: read, grep$/m);
+		assert.match(createdContent, /^requiredSkills: load-project-state, review-plan$/m);
+		assert.match(createdContent, /^optionalSkills: codeguard$/m);
+		assert.match(createdContent, /^acceptanceCapability: read-only$/m);
+		assert.doesNotMatch(createdContent, /^acceptanceRole:/m);
+		assert.match(readText(handleManagementAction("get", { agent: "stan-role" }, ctx)), /Acceptance capability: read-only/);
+
+		const updated = handleUpdate({ agent: "stan-role", config: {
+			requiredTools: "read, grep, find",
+			acceptanceCapability: "mutating",
+		} }, ctx);
+		assert.equal(updated.isError, false, readText(updated));
+		const updatedContent = fs.readFileSync(filePath, "utf-8");
+		assert.match(updatedContent, /^requiredTools: read, grep, find$/m);
+		assert.match(updatedContent, /^acceptanceCapability: mutating$/m);
+		assert.doesNotMatch(updatedContent, /^acceptanceRole:/m);
+
+		const conflict = handleUpdate({ agent: "stan-role", config: { acceptanceRole: "read-only" } }, ctx);
+		assert.equal(conflict.isError, true);
+		assert.match(readText(conflict), /acceptanceCapability conflicts with config\.acceptanceRole/);
+		assert.match(fs.readFileSync(filePath, "utf-8"), /^acceptanceCapability: mutating$/m, "rejected updates must not rewrite the role card");
+	});
+
 	it("creates agents with completion guard disabled", () => {
 		const ctx = { cwd: tempDir, modelRegistry: { getAvailable: () => [] } };
 		const result = handleCreate(

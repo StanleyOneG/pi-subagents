@@ -4,10 +4,10 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import type { Message } from "@earendil-works/pi-ai";
-import { writeAtomicJson } from "../../shared/atomic-json.ts";
+import { writePrivateAtomicJson as writeAtomicJson } from "../../shared/atomic-json.ts";
 import { createChildTranscriptWriter, type ChildTranscriptWriter } from "../../shared/child-transcript.ts";
 import { closeSteerInbox, consumeInterruptRequest, consumeSteerRequests, deliverInterruptRequest, deliverStopRequest, deliverTimeoutRequest, enqueueStepSteer, steerAcksDir, steerCapabilityPath, stepSteerInboxDir, watchAsyncControlInbox, type SteerAck, type SteerCapability, type SteerRequest } from "./control-channel.ts";
-import { appendJsonl as appendRawJsonl, formatOutputArtifactContent, getArtifactPaths } from "../../shared/artifacts.ts";
+import { appendJsonl as appendRawJsonl, ensureArtifactsDir, formatOutputArtifactContent, getArtifactPaths, openPrivateArtifactForWrite, writeArtifact, writeMetadata } from "../../shared/artifacts.ts";
 import { PI_CODING_AGENT_PACKAGE, getPiSpawnCommand, resolveInstalledPiPackageRoot } from "../shared/pi-spawn.ts";
 import { captureSingleOutputSnapshot, extractChildWrittenOutput, finalizeSingleOutput, formatSavedOutputReference, injectOutputPathSystemPrompt, injectSingleOutputInstruction, resolveSingleOutput, type SingleOutputSnapshot } from "../shared/single-output.ts";
 import {
@@ -199,6 +199,7 @@ interface StepResult {
 	execution?: import("../../shared/types.ts").ExecutionProjection;
 	review?: import("../../shared/types.ts").ReviewProjection;
 	effects?: import("../../shared/types.ts").EffectsProjection;
+	observedMutationAttempt?: boolean;
 	structuredOutput?: unknown;
 	structuredOutputPath?: string;
 	structuredOutputSchemaPath?: string;
@@ -446,7 +447,8 @@ function runPiStreaming(
 		const startedAt = Date.now();
 		const processInstanceId = randomUUID();
 		onWriterProcess?.({ state: "spawning" });
-		const outputStream = fs.createWriteStream(outputFile, { flags: "w" });
+		const outputFd = openPrivateArtifactForWrite(outputFile);
+		const outputStream = fs.createWriteStream(outputFile, { fd: outputFd, flags: "w", autoClose: true });
 		const spawnEnv = { ...process.env, ...(env ?? {}), ...getSubagentDepthEnv(maxSubagentDepth) };
 		const spawnSpec = getPiSpawnCommand(args, {
 			...(piPackageRoot ? { piPackageRoot } : {}),
@@ -955,7 +957,7 @@ function writeRunLog(
 	}
 	lines.push(input.summary.trim() || "(no output)");
 	lines.push("");
-	fs.writeFileSync(logPath, lines.join("\n"), "utf-8");
+	writeArtifact(logPath, lines.join("\n"));
 }
 
 /** Context for running a single step */
@@ -1034,6 +1036,7 @@ async function runSingleStep(
 	structuredOutputSchemaPath?: string;
 	acceptance?: import("../../shared/types.ts").AcceptanceLedger;
 	writerAttemptCount?: number;
+	observedMutationAttempt?: boolean;
 }> {
 	if (step.importAsyncRoot) {
 		let importTimedOut = false;
@@ -1072,7 +1075,7 @@ async function runSingleStep(
 				timeoutMessage: importStopped || ctx.stopSignal?.aborted === true ? ctx.stopMessage : ctx.timeoutMessage,
 			});
 			try {
-				fs.writeFileSync(ctx.outputFile, imported.output, "utf-8");
+				writeArtifact(ctx.outputFile, imported.output);
 			} catch {
 				// Output files are observability only for imported roots.
 			}
@@ -1122,9 +1125,9 @@ async function runSingleStep(
 	if (ctx.artifactsDir && ctx.artifactConfig?.enabled !== false) {
 		const index = ctx.flatStepCount > 1 ? ctx.flatIndex : undefined;
 		artifactPaths = getArtifactPaths(ctx.artifactsDir, ctx.id, step.agent, index);
-		fs.mkdirSync(ctx.artifactsDir, { recursive: true });
+		ensureArtifactsDir(ctx.artifactsDir);
 		if (ctx.artifactConfig?.includeInput !== false) {
-			fs.writeFileSync(artifactPaths.inputPath, `# Task for ${step.agent}\n\n${task}`, "utf-8");
+			writeArtifact(artifactPaths.inputPath, `# Task for ${step.agent}\n\n${task}`);
 		}
 		if (ctx.artifactConfig?.includeTranscript !== false) {
 			transcriptWriter = createChildTranscriptWriter({
@@ -1154,6 +1157,7 @@ async function runSingleStep(
 	let finalResult: RunPiStreamingResult | undefined;
 	let finalOutputSnapshot: SingleOutputSnapshot | undefined;
 	let completionGuardTriggeredFinal = false;
+	let observedMutationAttempt = false;
 	let turnBudget = ctx.turnBudget ? initialTurnBudgetState(ctx.turnBudget) : undefined;
 	let toolBudget = step.toolBudget ? initialToolBudgetState(step.toolBudget) : undefined;
 	let toolBudgetBlocked = false;
@@ -1165,7 +1169,7 @@ async function runSingleStep(
 		if (ctx.timeoutSignal?.aborted || ctx.stopSignal?.aborted || ctx.skipAcceptance?.()) break;
 		const candidate = candidates[modelIndex];
 		ctx.onAttemptStart?.({ model: candidate, thinking: resolveEffectiveThinking(candidate, step.thinking) });
-		const outputSnapshot = captureSingleOutputSnapshot(step.outputPath);
+		const outputSnapshot = captureSingleOutputSnapshot(step.outputPath, step.outputPrivateRoot);
 		if (effectiveStructuredOutput) {
 			try {
 				if (fs.existsSync(effectiveStructuredOutput.outputPath)) fs.unlinkSync(effectiveStructuredOutput.outputPath);
@@ -1328,7 +1332,8 @@ async function runSingleStep(
 			if (structured.error) structuredError = structured.error;
 			else structuredOutput = structured.value;
 		}
-		const completionGuardEnabled = isAgentContractV1(step.agentContract) ? step.completionGuard === true : step.completionGuard !== false;
+		const completionGuardEnabled = step.effectiveAcceptance?.context.capability !== "read-only"
+			&& (isAgentContractV1(step.agentContract) ? step.completionGuard === true : step.completionGuard !== false);
 		const completionGuard = run.exitCode === 0 && !run.error && !toolAvailabilityError && !hiddenError?.hasError && !emptyOutputError && completionGuardEnabled
 			? evaluateCompletionMutationGuard({
 				agent: step.agent,
@@ -1366,6 +1371,7 @@ async function runSingleStep(
 					? `${hiddenError.errorType} failed (exit ${effectiveExitCode}): ${hiddenError.details}`
 					: `${hiddenError.errorType} failed with exit code ${effectiveExitCode}`
 				: run.error || (run.exitCode !== 0 && run.stderr.trim() ? run.stderr.trim() : undefined));
+		observedMutationAttempt = observedMutationAttempt || run.observedMutationAttempt === true;
 		const attempt: ModelAttempt = {
 			model: candidate ?? run.model ?? step.model ?? "default",
 			success: effectiveExitCode === 0 && !error,
@@ -1438,7 +1444,7 @@ async function runSingleStep(
 	const rawOutput = finalResult?.finalOutput ?? "";
 	const outputForPersistence = stripAcceptanceReport(rawOutput);
 	const resolvedOutput = step.outputPath && finalResult?.exitCode === 0
-		? resolveSingleOutput(step.outputPath, outputForPersistence, finalOutputSnapshot)
+		? resolveSingleOutput(step.outputPath, outputForPersistence, finalOutputSnapshot, step.outputPrivateRoot)
 		: { fullOutput: outputForPersistence };
 	const output = stripAcceptanceReport(resolvedOutput.fullOutput);
 	const outputReference = resolvedOutput.savedPath ? formatSavedOutputReference(resolvedOutput.savedPath, output) : undefined;
@@ -1479,6 +1485,7 @@ async function runSingleStep(
 				? { content: childWrittenOutput, path: step.outputPath, authoritative: step.outputMode === "file-only" }
 				: undefined,
 			cwd: step.cwd ?? ctx.cwd,
+			observedMutationAttempt: observedMutationAttempt || undefined,
 			signal: combinedAbortSignal([ctx.timeoutSignal, ctx.stopSignal]),
 			abortMessage: ctx.stopSignal?.aborted ? ctx.stopMessage ?? "Subagent stopped by user." : ctx.timeoutMessage ?? "Subagent timed out.",
 			reportOptional: isAgentContractV1(step.agentContract),
@@ -1497,7 +1504,7 @@ async function runSingleStep(
 					: acceptance
 		: undefined;
 	const acceptanceFailure = effectiveAcceptance ? acceptanceFailureMessage(effectiveAcceptance) : undefined;
-	const acceptanceCanFailRun = acceptanceFailure && effectiveAcceptance?.explicit && (finalResult?.exitCode ?? 1) === 0 && !finalResult?.interrupted && !timedOutAfterAcceptance && !stoppedAfterAcceptance && !turnBudgetExceeded && !isAgentContractV1(step.agentContract);
+	const acceptanceCanFailRun = acceptanceFailure && (effectiveAcceptance?.explicit || effectiveAcceptance?.effectiveAcceptance.context.capability === "read-only") && (finalResult?.exitCode ?? 1) === 0 && !finalResult?.interrupted && !timedOutAfterAcceptance && !stoppedAfterAcceptance && !turnBudgetExceeded && !isAgentContractV1(step.agentContract);
 	const effectiveFinalExitCode = timedOutAfterAcceptance || stoppedAfterAcceptance || turnBudgetExceeded ? 1 : acceptanceCanFailRun ? 1 : finalResult?.exitCode ?? 1;
 	const effectiveFinalError = stoppedAfterAcceptance
 		? ctx.stopMessage ?? "Subagent stopped by user."
@@ -1511,17 +1518,17 @@ async function runSingleStep(
 
 	if (artifactPaths && ctx.artifactConfig?.enabled !== false) {
 		if (ctx.artifactConfig?.includeOutput !== false) {
-			fs.writeFileSync(artifactPaths.outputPath, formatOutputArtifactContent({
+			writeArtifact(artifactPaths.outputPath, formatOutputArtifactContent({
 				output,
 				error: effectiveFinalError,
 				transcriptPath: transcriptWriter ? artifactPaths.transcriptPath : undefined,
 				metadataPath: ctx.artifactConfig?.includeMetadata === false ? undefined : artifactPaths.metadataPath,
-			}), "utf-8");
+			}));
 		}
 		if (ctx.artifactConfig?.includeMetadata !== false) {
-			fs.writeFileSync(
+			writeMetadata(
 				artifactPaths.metadataPath,
-				JSON.stringify({
+				{
 					runId: ctx.id,
 					agent: step.agent,
 					task,
@@ -1536,9 +1543,11 @@ async function runSingleStep(
 					...(transcriptWriter ? { transcriptPath: artifactPaths.transcriptPath } : {}),
 					transcriptError: transcriptWriter?.getError(),
 					skills: step.skills,
+					skillsWarning: step.skillsWarning,
+					resourceProvenance: step.resourceProvenance,
+					observedMutationAttempt: observedMutationAttempt || undefined,
 					timestamp: Date.now(),
-				}, null, 2),
-				"utf-8",
+				},
 			);
 		}
 	}
@@ -1561,6 +1570,10 @@ async function runSingleStep(
 		artifactPaths,
 		transcriptPath: transcriptWriter ? artifactPaths?.transcriptPath : undefined,
 		transcriptError: transcriptWriter?.getError(),
+		skills: step.skills,
+		skillsWarning: step.skillsWarning,
+		resourceProvenance: step.resourceProvenance,
+		observedMutationAttempt: observedMutationAttempt || undefined,
 		interrupted: timedOutAfterAcceptance || stoppedAfterAcceptance || turnBudgetExceeded ? false : finalResult?.interrupted,
 		timedOut: timedOutAfterAcceptance ? true : finalResult?.timedOut,
 		stopped: stoppedAfterAcceptance ? true : finalResult?.stopped,
@@ -2882,6 +2895,7 @@ async function runSubagent(
 				explicit: step.acceptanceInput,
 				agentName: step.parallel.agent,
 				acceptanceRole: step.acceptanceRole,
+				acceptanceCapability: step.acceptanceCapability,
 				task: materialized.parallel.map((task) => task.task ?? step.parallel.task).join("\n") || step.parallel.task,
 				mode: config.mode,
 				async: true,
@@ -2967,6 +2981,7 @@ async function runSubagent(
 						explicit: step.parallel.acceptanceInput,
 						agentName: step.parallel.agent,
 						acceptanceRole: step.parallel.acceptanceRole,
+						acceptanceCapability: step.parallel.acceptanceCapability ?? step.acceptanceCapability,
 						task: materializedTask,
 						mode: config.mode,
 						async: true,
@@ -3146,6 +3161,7 @@ async function runSubagent(
 				statusPayload.steps[fi].agentContract = singleResult.agentContract;
 				statusPayload.steps[fi].launchContractDigest = singleResult.launchContractDigest;
 				statusPayload.steps[fi].effects = singleResult.effects;
+				statusPayload.steps[fi].observedMutationAttempt = singleResult.observedMutationAttempt;
 				statusPayload.steps[fi].execution = singleResult.execution;
 				statusPayload.steps[fi].review = singleResult.review;
 				statusPayload.steps[fi].structuredOutput = singleResult.structuredOutput;
@@ -3202,6 +3218,7 @@ async function runSubagent(
 					effects: pr.effects,
 					execution: pr.execution,
 					review: pr.review,
+					observedMutationAttempt: pr.observedMutationAttempt,
 					structuredOutput: pr.structuredOutput,
 					structuredOutputPath: pr.structuredOutputPath,
 					structuredOutputSchemaPath: pr.structuredOutputSchemaPath,
@@ -3243,6 +3260,7 @@ async function runSubagent(
 								notes: `Dynamic fanout collected ${collection.length} result(s) into ${step.collect.as}.`,
 							}),
 							cwd,
+							observedMutationAttempt: parallelResults.some((result) => result.observedMutationAttempt === true),
 							signal: combinedAbortSignal([timeoutAbortController.signal, stopAbortController.signal]),
 							abortMessage: stopAbortController.signal.aborted ? stopMessage : timeoutMessage ?? "Subagent timed out.",
 							reportOptional: isAgentContractV1(step.agentContract),
@@ -3251,7 +3269,7 @@ async function runSubagent(
 					const groupStopped = stopped || stopAbortController.signal.aborted;
 					const groupTimedOut = !groupStopped && (timedOut || timeoutAbortController.signal.aborted);
 					const effectiveGroupAcceptance = groupTimedOut || groupStopped ? undefined : groupAcceptance;
-					const groupAcceptanceFailure = effectiveDynamicGroupAcceptance.explicit && effectiveGroupAcceptance && (!isAgentContractV1(step.agentContract) || step.gateOn === "acceptance") ? acceptanceFailureMessage(effectiveGroupAcceptance) : undefined;
+					const groupAcceptanceFailure = (effectiveDynamicGroupAcceptance.explicit || effectiveDynamicGroupAcceptance.context.capability === "read-only") && effectiveGroupAcceptance && (!isAgentContractV1(step.agentContract) || step.gateOn === "acceptance") ? acceptanceFailureMessage(effectiveGroupAcceptance) : undefined;
 					const groupError = groupStopped ? stopMessage : groupTimedOut ? timeoutMessage ?? "Subagent timed out." : groupAcceptanceFailure;
 					markDynamicGraphGroup(stepIndex, groupError ? groupStopped ? "stopped" : "failed" : "completed", groupError, effectiveGroupAcceptance);
 					if (groupError) {
@@ -3486,6 +3504,7 @@ async function runSubagent(
 						statusPayload.steps[fi].transcriptError = singleResult.transcriptError;
 						statusPayload.steps[fi].agentContract = singleResult.agentContract;
 						statusPayload.steps[fi].effects = singleResult.effects;
+						statusPayload.steps[fi].observedMutationAttempt = singleResult.observedMutationAttempt;
 						statusPayload.steps[fi].execution = singleResult.execution;
 						statusPayload.steps[fi].review = singleResult.review;
 						statusPayload.steps[fi].structuredOutput = singleResult.structuredOutput;
@@ -3576,6 +3595,7 @@ async function runSubagent(
 						transcriptPath: pr.transcriptPath,
 						transcriptError: pr.transcriptError,
 						effects: pr.effects,
+						observedMutationAttempt: pr.observedMutationAttempt,
 						execution: pr.execution,
 						review: pr.review,
 						structuredOutput: pr.structuredOutput,
@@ -3743,6 +3763,7 @@ async function runSubagent(
 				transcriptPath: singleResult.transcriptPath,
 				transcriptError: singleResult.transcriptError,
 				effects: singleResult.effects,
+				observedMutationAttempt: singleResult.observedMutationAttempt,
 				execution: singleResult.execution,
 				review: singleResult.review,
 				structuredOutput: singleResult.structuredOutput,
@@ -3819,6 +3840,7 @@ async function runSubagent(
 			statusPayload.steps[flatIndex].transcriptError = singleResult.transcriptError;
 			statusPayload.steps[flatIndex].agentContract = singleResult.agentContract;
 			statusPayload.steps[flatIndex].effects = singleResult.effects;
+			statusPayload.steps[flatIndex].observedMutationAttempt = singleResult.observedMutationAttempt;
 			statusPayload.steps[flatIndex].execution = singleResult.execution;
 			statusPayload.steps[flatIndex].review = singleResult.review;
 			statusPayload.steps[flatIndex].structuredOutput = singleResult.structuredOutput;
@@ -4063,6 +4085,7 @@ async function runSubagent(
 				execution: r.execution,
 				review: r.review,
 				effects: r.effects,
+				observedMutationAttempt: r.observedMutationAttempt,
 				structuredOutput: r.structuredOutput,
 				structuredOutputPath: r.structuredOutputPath,
 				structuredOutputSchemaPath: r.structuredOutputSchemaPath,

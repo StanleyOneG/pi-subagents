@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { writeAtomicJson } from "../../shared/atomic-json.ts";
+import { writePrivateAtomicJson as writeAtomicJson } from "../../shared/atomic-json.ts";
+import { readPrivateArtifact, writeArtifact } from "../../shared/artifacts.ts";
 import type {
 	ParallelHandoffGroup,
 	ParallelHandoffManifest,
@@ -25,7 +26,7 @@ export interface ParallelHandoffResult {
 
 function readManifest(manifestPath: string): ParallelHandoffManifest | undefined {
 	if (!fs.existsSync(manifestPath)) return undefined;
-	const parsed = JSON.parse(fs.readFileSync(manifestPath, "utf-8")) as ParallelHandoffManifest;
+	const parsed = JSON.parse(readPrivateArtifact(manifestPath)) as ParallelHandoffManifest;
 	if (parsed.version !== 1 || !Array.isArray(parsed.groups)) {
 		throw new Error(`Invalid parallel handoff manifest: ${manifestPath}`);
 	}
@@ -51,8 +52,7 @@ function safeHandoffAgentName(agent: string): string {
 function missingDiff(input: { manifestPath: string; stepIndex: number; taskIndex: number; agent: string; branch?: string }): WorktreeDiff {
 	const patchPath = path.join(path.dirname(input.manifestPath), `missing-diff-step-${input.stepIndex}-task-${input.taskIndex}-${safeHandoffAgentName(input.agent)}.patch`);
 	try {
-		fs.mkdirSync(path.dirname(patchPath), { recursive: true });
-		fs.writeFileSync(patchPath, "", "utf-8");
+		writeArtifact(patchPath, "");
 	} catch {
 		// Handoff records the artifact failure below; patch creation remains best-effort.
 	}

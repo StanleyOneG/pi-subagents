@@ -64,6 +64,31 @@ Review the diff
 		assert.match(serializeChain(parsed), /toolBudget: \{"soft":3,"hard":5,"block":\["read","grep"\]\}/);
 	});
 
+	it("round-trips markdown acceptance with expected TDD failure outcomes", () => {
+		const parsed = parseChain(`---
+name: stan-tdd
+description: Stan TDD chain
+---
+
+## stan-test-engineer
+acceptance: {"level":"checked","evidence":["commands-run"],"criteria":[{"id":"red","must":"Record the named RED gate","evidence":["commands-run"],"allowedCommandOutcomes":["expected-red","expected-failure"]}]}
+
+Run the RED gate
+`, "project", "/tmp/stan-tdd.chain.md");
+
+		assert.deepEqual(parsed.steps[0]?.acceptance, {
+			level: "checked",
+			evidence: ["commands-run"],
+			criteria: [{
+				id: "red",
+				must: "Record the named RED gate",
+				evidence: ["commands-run"],
+				allowedCommandOutcomes: ["expected-red", "expected-failure"],
+			}],
+		});
+		assert.match(serializeChain(parsed), /allowedCommandOutcomes.*expected-red.*expected-failure/);
+	});
+
 	it("rejects invalid markdown chain toolBudget", () => {
 		assert.throws(
 			() => parseChain(`---

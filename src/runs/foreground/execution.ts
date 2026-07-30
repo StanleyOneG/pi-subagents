@@ -46,15 +46,16 @@ import {
 	extractToolArgsPreview,
 	extractTextFromContent,
 } from "../../shared/utils.ts";
-import { buildSkillInjection, resolveSkillsWithFallback } from "../../agents/skills.ts";
+import { buildSkillInjection } from "../../agents/skills.ts";
 import { buildAgentMemoryInjection } from "../../agents/agent-memory.ts";
 import { evaluateCompletionMutationGuard } from "../shared/completion-guard.ts";
+import { preflightSubagentResources } from "../shared/resource-preflight.ts";
 import { getPiSpawnCommand } from "../shared/pi-spawn.ts";
 import { createJsonlWriter } from "../../shared/jsonl-writer.ts";
 import { attachPostExitStdioGuard, trySignalChild } from "../../shared/post-exit-stdio-guard.ts";
 import { applyThinkingSuffix, buildPiArgs, cleanupTempDir, resolvePiLaunchToolPlan } from "../shared/pi-args.ts";
 import { decodeSubagentCapabilityCeiling, resolveCurrentSubagentCapabilityCeiling, SUBAGENT_CAPABILITY_CEILING_ENV } from "../shared/capability-ceiling.ts";
-import { resolveEffectiveThinking } from "../../shared/model-info.ts";
+import { applyMetadataGatedThinkingSuffix, resolveEffectiveThinking } from "../../shared/model-info.ts";
 import { MISSING_STRUCTURED_OUTPUT_CALL_ERROR, readStructuredOutput } from "../shared/structured-output.ts";
 import { readChildToolDiagnosticError } from "../shared/tool-availability.ts";
 import { captureSingleOutputSnapshot, extractChildWrittenOutput, formatSavedOutputReference, injectOutputPathSystemPrompt, resolveSingleOutput, validateFileOnlyOutputMode, type SingleOutputSnapshot } from "../shared/single-output.ts";
@@ -179,6 +180,7 @@ function snapshotResult(result: SingleResult, progress: AgentProgress): SingleRe
 		messages: result.outputMode === "file-only" && result.savedOutputPath ? undefined : result.messages ? [...result.messages] : undefined,
 		usage: { ...result.usage },
 		skills: result.skills ? [...result.skills] : undefined,
+		resourceProvenance: result.resourceProvenance ? result.resourceProvenance.map((entry) => ({ ...entry })) : undefined,
 		attemptedModels: result.attemptedModels ? [...result.attemptedModels] : undefined,
 		modelAttempts: result.modelAttempts
 			? result.modelAttempts.map((attempt) => ({
@@ -205,6 +207,7 @@ async function runSingleAttempt(
 		sessionEnabled: boolean;
 		systemPrompt: string;
 		resolvedSkillNames?: string[];
+		resourceProvenance?: SingleResult["resourceProvenance"];
 		modelCandidates?: string[];
 		skillsWarning?: string;
 		jsonlPath?: string;
@@ -308,6 +311,7 @@ async function runSingleAttempt(
 		transcriptPath: shared.transcriptWriter ? shared.artifactPaths?.transcriptPath : undefined,
 		skills: shared.resolvedSkillNames,
 		skillsWarning: shared.skillsWarning,
+		resourceProvenance: shared.resourceProvenance,
 		...(options.turnBudget ? { turnBudget: initialTurnBudgetState(options.turnBudget) } : {}),
 		...(options.toolBudget ? { toolBudget: initialToolBudgetState(options.toolBudget) } : {}),
 		...(options.capabilityCeiling ? { capabilityCeiling: options.capabilityCeiling } : {}),
@@ -980,7 +984,7 @@ async function runSingleAttempt(
 				fullOutput = fullOutput.trim() || recoveredResult.error || recoveredResult.finalOutput || "Detached child exited without final output.";
 				recoveredResult.outputMode = options.outputMode ?? "inline";
 				if (options.outputPath && recoveredResult.exitCode === 0) {
-					const resolvedOutput = resolveSingleOutput(options.outputPath, fullOutput, shared.outputSnapshot);
+					const resolvedOutput = resolveSingleOutput(options.outputPath, fullOutput, shared.outputSnapshot, options.outputPrivateRoot);
 					fullOutput = stripAcceptanceReport(resolvedOutput.fullOutput);
 					recoveredResult.savedOutputPath = resolvedOutput.savedPath;
 					recoveredResult.outputSaveError = resolvedOutput.saveError;
@@ -1165,7 +1169,8 @@ async function runSingleAttempt(
 		const note = turnBudgetSoftNote(result.turnBudget, result.turnBudget.wrapUpRequestedAtTurn ?? result.turnBudget.turnCount);
 		fullOutput = fullOutput.trim() ? `${note}\n\n${fullOutput}` : note;
 	}
-	const completionGuardEnabled = isAgentContractV1(options.agentContract) ? agent.completionGuard === true : agent.completionGuard !== false;
+	const completionGuardEnabled = agent.acceptanceCapability !== "read-only"
+		&& (isAgentContractV1(options.agentContract) ? agent.completionGuard === true : agent.completionGuard !== false);
 	const completionGuard = result.exitCode === 0 && !result.error && completionGuardEnabled
 		? evaluateCompletionMutationGuard({
 			agent: agent.name,
@@ -1204,7 +1209,7 @@ async function runSingleAttempt(
 		}));
 	}
 		if (options.outputPath && result.exitCode === 0) {
-			const resolvedOutput = resolveSingleOutput(options.outputPath, fullOutput, shared.outputSnapshot);
+			const resolvedOutput = resolveSingleOutput(options.outputPath, fullOutput, shared.outputSnapshot, options.outputPrivateRoot);
 			fullOutput = stripAcceptanceReport(resolvedOutput.fullOutput);
 			result.savedOutputPath = resolvedOutput.savedPath;
 			result.outputSaveError = resolvedOutput.saveError;
@@ -1212,6 +1217,7 @@ async function runSingleAttempt(
 				result.outputReference = formatSavedOutputReference(resolvedOutput.savedPath, fullOutput);
 			}
 	}
+	result.observedMutationAttempt = observedMutationAttempt || undefined;
 		artifactOutputByResult.set(result, fullOutput);
 		acceptanceOutputByResult.set(result, acceptanceOutput);
 	result.outputMode = options.outputMode ?? "inline";
@@ -1279,6 +1285,7 @@ export async function runSync(
 		explicit: options.acceptance,
 		agentName,
 		acceptanceRole: agent.acceptanceRole,
+		acceptanceCapability: agent.acceptanceCapability,
 		task,
 		mode: options.acceptanceContext?.mode ?? "single",
 		async: options.acceptanceContext?.async,
@@ -1289,25 +1296,38 @@ export async function runSync(
 	const acceptancePrompt = formatAcceptancePrompt(effectiveAcceptance, { reportOptional: isAgentContractV1(options.agentContract) });
 	const taskWithAcceptance = acceptancePrompt ? `${task}\n${acceptancePrompt}` : task;
 	const sessionEnabled = Boolean(options.sessionFile || options.sessionDir) || shareEnabled;
-	const skillNames = options.skills ?? agent.skills ?? [];
 	const skillCwd = options.cwd ?? runtimeCwd;
-	const { resolved: resolvedSkills, missing: missingSkills } = resolveSkillsWithFallback(
-		skillNames,
-		skillCwd,
-		runtimeCwd,
-		agent.skillPath,
-		agent.filePath ? path.dirname(agent.filePath) : skillCwd,
-	);
-	if (skillNames.some((skill) => skill.trim() === "pi-subagents") && missingSkills.includes("pi-subagents")) {
+	const hasSeparatedSkillPreflight = options.resourcePreflightSkills !== undefined
+		|| options.resourcePreflightUseAgentSkills !== undefined;
+	const resources = preflightSubagentResources({
+		agent,
+		cwd: skillCwd,
+		fallbackCwd: runtimeCwd,
+		...(options.availableToolNames !== undefined ? { availableToolNames: options.availableToolNames } : {}),
+		...(hasSeparatedSkillPreflight
+			? {
+				skills: options.resourcePreflightSkills ?? [],
+				useAgentSkills: options.resourcePreflightUseAgentSkills ?? false,
+			}
+			: options.skills !== undefined
+				? { skills: options.skills, useAgentSkills: false }
+				: {}),
+	});
+	if (resources.failure) {
 		return withRunContext({
 			agent: agentName,
 			task,
+			index: options.index,
 			exitCode: 1,
 			messages: [],
 			usage: emptyUsage(),
-			error: "Skills not found: pi-subagents",
+			preflight: resources.failure,
+			resourceProvenance: resources.resolvedSkillProvenance,
+			error: resources.failure.message,
 		}, options.context);
 	}
+	const resolvedSkills = resources.resolvedSkills;
+	const skillsWarning = resources.optionalSkillWarnings.length > 0 ? resources.optionalSkillWarnings.join("\n") : undefined;
 	let systemPrompt = agent.systemPrompt?.trim() || "";
 	if (resolvedSkills.length > 0) {
 		const skillInjection = buildSkillInjection(resolvedSkills);
@@ -1319,13 +1339,21 @@ export async function runSync(
 	}
 	systemPrompt = injectOutputPathSystemPrompt(systemPrompt, options.outputPath, agent);
 
+	const effectiveThinking = options.thinkingOverride ?? agent.thinking;
 	const candidates = buildModelCandidates(
 		options.modelOverride ?? agent.model,
 		agent.fallbackModels,
 		options.availableModels,
 		options.preferredModelProvider,
 		{ scope: options.modelScope },
-	);
+	).map((candidate) => applyMetadataGatedThinkingSuffix(
+		candidate,
+		effectiveThinking,
+		options.thinkingOverride !== undefined,
+		options.availableModels,
+		options.preferredModelProvider,
+		"Foreground subagent",
+	));
 	const attemptedModels: string[] = [];
 	const modelAttempts: ModelAttempt[] = [];
 	const aggregateUsage = emptyUsage();
@@ -1385,6 +1413,8 @@ export async function runSync(
 			transcriptError: target.transcriptError,
 			skills: target.skills,
 			skillsWarning: target.skillsWarning,
+			resourceProvenance: target.resourceProvenance,
+			observedMutationAttempt: target.observedMutationAttempt,
 			timestamp: Date.now(),
 		});
 	};
@@ -1404,11 +1434,12 @@ export async function runSync(
 							? { content: childWrittenOutput, path: options.outputPath, authoritative: options.outputMode === "file-only" }
 							: undefined,
 						cwd: options.cwd ?? runtimeCwd,
+						observedMutationAttempt: recoveredResult.observedMutationAttempt,
 						reportOptional: isAgentContractV1(options.agentContract),
 					});
 					const acceptanceFailure = acceptanceFailureMessage(recoveredResult.acceptance);
 					stripAcceptanceReportsFromMessages(recoveredResult.messages);
-					if (acceptanceFailure && recoveredResult.acceptance.explicit && recoveredResult.exitCode === 0 && !isAgentContractV1(options.agentContract)) {
+					if (acceptanceFailure && (recoveredResult.acceptance.explicit || recoveredResult.acceptance.effectiveAcceptance.context.capability === "read-only") && recoveredResult.exitCode === 0 && !isAgentContractV1(options.agentContract)) {
 						recoveredResult.exitCode = 1;
 						recoveredResult.error = recoveredResult.error ? `${recoveredResult.error}\n${acceptanceFailure}` : acceptanceFailure;
 						if (recoveredResult.progress) {
@@ -1430,16 +1461,18 @@ export async function runSync(
 		: options;
 
 	let lastResult: SingleResult | undefined;
+	let observedMutationAttempt = false;
 	const modelsToTry = candidates.length > 0 ? candidates : [undefined];
 	modelAttemptsLoop: for (let modelIndex = 0; modelIndex < modelsToTry.length; modelIndex++) {
 		const candidate = modelsToTry[modelIndex];
 		for (let startupAttemptIndex = 0; ; startupAttemptIndex++) {
-			const outputSnapshot = captureSingleOutputSnapshot(options.outputPath);
+			const outputSnapshot = captureSingleOutputSnapshot(options.outputPath, options.outputPrivateRoot);
 			const result = await runSingleAttempt(runtimeCwd, agent, taskWithAcceptance, candidate, detachedAwareOptions, {
 				sessionEnabled,
 				systemPrompt,
 				resolvedSkillNames: resolvedSkills.length > 0 ? resolvedSkills.map((skill) => skill.name) : undefined,
-				skillsWarning: missingSkills.length > 0 ? `Skills not found: ${missingSkills.join(", ")}` : undefined,
+				resourceProvenance: resources.resolvedSkillProvenance,
+				skillsWarning,
 				jsonlPath,
 				artifactPaths: artifactPathsResult,
 				transcriptWriter,
@@ -1449,6 +1482,7 @@ export async function runSync(
 				originalTask: task,
 			});
 			lastResult = result;
+			observedMutationAttempt = observedMutationAttempt || result.observedMutationAttempt === true;
 			if (startupAttemptIndex === 0) {
 				if (result.model) attemptedModels.push(result.model);
 				else if (candidate) attemptedModels.push(candidate);
@@ -1546,6 +1580,7 @@ export async function runSync(
 	} satisfies SingleResult, options.context);
 
 	result.usage = aggregateUsage;
+	result.observedMutationAttempt = observedMutationAttempt || undefined;
 	result.attemptedModels = attemptedModels.length > 0 ? attemptedModels : undefined;
 	result.modelAttempts = modelAttempts.length > 0 ? modelAttempts : undefined;
 	result.progressSummary = {
@@ -1603,12 +1638,13 @@ export async function runSync(
 				? { content: childWrittenOutput, path: options.outputPath, authoritative: options.outputMode === "file-only" }
 				: undefined,
 			cwd: options.cwd ?? runtimeCwd,
+			observedMutationAttempt: result.observedMutationAttempt,
 			reportOptional: isAgentContractV1(options.agentContract),
 		});
 	}
 	const acceptanceFailure = acceptanceFailureMessage(result.acceptance);
 	stripAcceptanceReportsFromMessages(result.messages);
-	if (acceptanceFailure && result.acceptance.explicit && result.exitCode === 0 && !result.detached && !result.interrupted && !result.timedOut && !isAgentContractV1(options.agentContract)) {
+	if (acceptanceFailure && (result.acceptance.explicit || result.acceptance.effectiveAcceptance.context.capability === "read-only") && result.exitCode === 0 && !result.detached && !result.interrupted && !result.timedOut && !isAgentContractV1(options.agentContract)) {
 		result.exitCode = 1;
 		result.error = result.error ? `${result.error}\n${acceptanceFailure}` : acceptanceFailure;
 		if (result.progress) {

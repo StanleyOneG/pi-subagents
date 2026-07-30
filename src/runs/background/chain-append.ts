@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { writeAtomicJson } from "../../shared/atomic-json.ts";
-import { appendJsonl } from "../../shared/artifacts.ts";
+import { writePrivateAtomicJson } from "../../shared/atomic-json.ts";
+import { appendJsonl, ensurePrivateDirectory } from "../../shared/artifacts.ts";
 import type { AsyncParallelGroupStatus, AsyncStatus, WorkflowGraphNode, WorkflowGraphSnapshot } from "../../shared/types.ts";
 import { readStatus } from "../../shared/utils.ts";
 import type { DynamicRunnerGroup, ParallelStepGroup, RunnerStep, RunnerSubagentStep } from "../shared/parallel-utils.ts";
@@ -82,12 +82,12 @@ export function enqueueChainAppendRequest(input: {
 		createdAt: input.now ?? Date.now(),
 		steps: input.steps,
 	};
-	fs.mkdirSync(appendDir(input.asyncDir), { recursive: true });
-	writeAtomicJson(appendRequestPath(input.asyncDir, request), request);
+	ensurePrivateDirectory(appendDir(input.asyncDir));
+	writePrivateAtomicJson(appendRequestPath(input.asyncDir, request), request);
 	const pendingCount = countPendingChainAppendRequests(input.asyncDir);
 	const statusPath = path.join(input.asyncDir, "status.json");
 	const updatedStatus = { ...status, pendingAppends: pendingCount, lastUpdate: request.createdAt };
-	writeAtomicJson(statusPath, updatedStatus);
+	writePrivateAtomicJson(statusPath, updatedStatus);
 	appendJsonl(path.join(input.asyncDir, "events.jsonl"), JSON.stringify({
 		type: "subagent.chain.append.requested",
 		ts: request.createdAt,

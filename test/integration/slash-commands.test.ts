@@ -306,6 +306,56 @@ describe("subagents watchdog slash command", { skip: !available ? "watchdog comm
 		});
 	});
 
+	it("rejects unsupported thinking-only max and reports saved unsupported max", async () => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-watchdog-max-", async (root) => {
+				const legacy = { provider: "test", id: "legacy", reasoning: true };
+				const modelRegistry = {
+					getAvailable: () => [legacy],
+					find: (provider: string, id: string) => provider === legacy.provider && id === legacy.id ? legacy : undefined,
+					hasConfiguredAuth: (model: unknown) => Boolean(model),
+				};
+				const ctx = createCommandContext({ cwd: root, model: legacy, modelRegistry });
+				const { commands, runtime, sent } = createWatchdogHarness();
+
+				await commands.get("subagents-watchdog")!.handler("thinking max", ctx);
+				assert.match(String((sent[0] as { content?: unknown }).content ?? ""), /explicit max-capable model/);
+				assert.equal(fs.existsSync(path.join(process.env.HOME!, ".pi", "agent", "settings.json")), false);
+
+				runtime.setSessionModel({ thinking: "max" }, root);
+				await commands.get("subagents-watchdog")!.handler("status", ctx);
+				assert.match(String((sent[1] as { content?: unknown }).content ?? ""), /Model config error:/);
+				await commands.get("subagents-watchdog")!.handler("check", ctx);
+				assert.match(String((sent[2] as { content?: unknown }).content ?? ""), /thinkingLevelMap\.max/);
+			});
+		});
+	});
+
+	it("rejects model-only updates that would retain persisted max", async () => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-watchdog-max-switch-", async (root) => {
+				const supported = { provider: "test", id: "metadata-max", reasoning: true, thinkingLevelMap: { max: "max" } };
+				const legacy = { provider: "test", id: "legacy", reasoning: true };
+				const models = [supported, legacy];
+				const modelRegistry = {
+					getAvailable: () => models,
+					find: (provider: string, id: string) => models.find((model) => model.provider === provider && model.id === id),
+					hasConfiguredAuth: (model: unknown) => Boolean(model),
+				};
+				const ctx = createCommandContext({ cwd: root, model: supported, modelRegistry });
+				const { commands, sent } = createWatchdogHarness();
+
+				await commands.get("subagents-watchdog")!.handler("model test/metadata-max:max", ctx);
+				await commands.get("subagents-watchdog")!.handler("model test/legacy", ctx);
+
+				assert.match(String((sent[1] as { content?: unknown }).content ?? ""), /thinkingLevelMap\.max/);
+				const settings = JSON.parse(fs.readFileSync(path.join(process.env.HOME!, ".pi", "agent", "settings.json"), "utf-8"));
+				assert.equal(settings.subagents.watchdog.main.model, "test/metadata-max");
+				assert.equal(settings.subagents.watchdog.main.thinking, "max");
+			});
+		});
+	});
+
 	it("supports session-scoped recommended watchdog models without writing settings", async () => {
 		await withIsolatedHome(async () => {
 			await withTempProject("pi-watchdog-session-model-", async (root) => {

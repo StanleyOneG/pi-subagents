@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Message } from "@earendil-works/pi-ai";
 import type { OutputMode, SavedOutputReference } from "../../shared/types.ts";
+import { assertSafePrivateArtifactFile, ensurePrivateArtifactFile, readPrivateArtifact, writeArtifact } from "../../shared/artifacts.ts";
 import { hasMutationToolCapability } from "./completion-guard.ts";
 
 export interface SingleOutputSnapshot {
@@ -61,6 +62,10 @@ export function normalizeSingleOutputOverride(
 	return undefined;
 }
 
+function relativeOutputHasTraversal(output: string): boolean {
+	return output.split(/[\\/]+/).some((part) => part === "..");
+}
+
 export function resolveSingleOutputPath(
 	output: string | boolean | undefined,
 	runtimeCwd: string,
@@ -69,7 +74,17 @@ export function resolveSingleOutputPath(
 ): string | undefined {
 	if (typeof output !== "string" || !output || output === "false" || output === "true") return undefined;
 	if (path.isAbsolute(output)) return output;
-	if (relativeBaseDir) return path.resolve(relativeBaseDir, output);
+	if (relativeBaseDir) {
+		if (relativeOutputHasTraversal(output)) {
+			throw new Error(`Runtime-owned relative output path must not contain '..': ${output}`);
+		}
+		const root = path.resolve(relativeBaseDir);
+		const target = path.resolve(root, output);
+		if (target === root || !target.startsWith(`${root}${path.sep}`)) {
+			throw new Error(`Runtime-owned relative output path escapes its output root: ${output}`);
+		}
+		return target;
+	}
 	const baseCwd = requestedCwd
 		? (path.isAbsolute(requestedCwd) ? requestedCwd : path.resolve(runtimeCwd, requestedCwd))
 		: runtimeCwd;
@@ -144,13 +159,31 @@ export function validateFileOnlyOutputMode(outputMode: OutputMode | undefined, o
 	return undefined;
 }
 
-export function captureSingleOutputSnapshot(outputPath: string | undefined): SingleOutputSnapshot | undefined {
+function isWithinRuntimeOwnedRoot(outputPath: string, runtimeOwnedRoot: string | undefined): boolean {
+	if (!runtimeOwnedRoot) return false;
+	const root = path.resolve(runtimeOwnedRoot);
+	const target = path.resolve(outputPath);
+	return target === root || target.startsWith(`${root}${path.sep}`);
+}
+
+function inspectRuntimeOwnedOutput(outputPath: string): fs.Stats {
+	assertSafePrivateArtifactFile(outputPath);
+	const stat = fs.lstatSync(outputPath);
+	if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw new Error(`Unsafe artifact file '${outputPath}'.`);
+	return stat;
+}
+
+export function captureSingleOutputSnapshot(outputPath: string | undefined, runtimeOwnedRoot?: string): SingleOutputSnapshot | undefined {
 	if (!outputPath) return undefined;
+	const runtimeOwned = isWithinRuntimeOwnedRoot(outputPath, runtimeOwnedRoot);
 	try {
-		const stat = fs.statSync(outputPath);
+		if (runtimeOwned) ensurePrivateArtifactFile(outputPath);
+		const stat = runtimeOwned ? inspectRuntimeOwnedOutput(outputPath) : fs.statSync(outputPath);
 		return { exists: true, mtimeMs: stat.mtimeMs, size: stat.size };
-	} catch {
-		// The snapshot is advisory; resolveSingleOutput reports concrete read/write failures.
+	} catch (error) {
+		const code = error && typeof error === "object" && "code" in error ? (error as { code?: unknown }).code : undefined;
+		if (!runtimeOwned && (code === "ENOENT" || code === "ENOTDIR")) return { exists: false };
+		if (runtimeOwned) throw error;
 		return { exists: false };
 	}
 }
@@ -158,11 +191,16 @@ export function captureSingleOutputSnapshot(outputPath: string | undefined): Sin
 function persistSingleOutput(
 	outputPath: string | undefined,
 	fullOutput: string,
+	runtimeOwnedRoot?: string,
 ): { savedPath?: string; error?: string } {
 	if (!outputPath) return {};
 	try {
-		fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-		fs.writeFileSync(outputPath, fullOutput, "utf-8");
+		if (isWithinRuntimeOwnedRoot(outputPath, runtimeOwnedRoot)) {
+			writeArtifact(outputPath, fullOutput);
+		} else {
+			fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+			fs.writeFileSync(outputPath, fullOutput, "utf-8");
+		}
 		return { savedPath: outputPath };
 	} catch (err) {
 		return { error: err instanceof Error ? err.message : String(err) };
@@ -173,12 +211,15 @@ export function resolveSingleOutput(
 	outputPath: string | undefined,
 	fallbackOutput: string,
 	beforeRun: SingleOutputSnapshot | undefined,
+	runtimeOwnedRoot?: string,
 ): { fullOutput: string; savedPath?: string; saveError?: string } {
 	if (!outputPath) return { fullOutput: fallbackOutput };
 
 	let changedSinceStart = false;
 	try {
-		const stat = fs.statSync(outputPath);
+		const stat = isWithinRuntimeOwnedRoot(outputPath, runtimeOwnedRoot)
+			? inspectRuntimeOwnedOutput(outputPath)
+			: fs.statSync(outputPath);
 		changedSinceStart = !beforeRun?.exists
 			|| stat.mtimeMs !== beforeRun.mtimeMs
 			|| stat.size !== beforeRun.size;
@@ -194,7 +235,10 @@ export function resolveSingleOutput(
 
 	if (changedSinceStart) {
 		try {
-			return { fullOutput: fs.readFileSync(outputPath, "utf-8"), savedPath: outputPath };
+			const content = isWithinRuntimeOwnedRoot(outputPath, runtimeOwnedRoot)
+				? readPrivateArtifact(outputPath)
+				: fs.readFileSync(outputPath, "utf-8");
+			return { fullOutput: content, savedPath: outputPath };
 		} catch (error) {
 			return {
 				fullOutput: fallbackOutput,
@@ -203,7 +247,7 @@ export function resolveSingleOutput(
 		}
 	}
 
-	const save = persistSingleOutput(outputPath, fallbackOutput);
+	const save = persistSingleOutput(outputPath, fallbackOutput, runtimeOwnedRoot);
 	if (save.savedPath) return { fullOutput: fallbackOutput, savedPath: save.savedPath };
 	return { fullOutput: fallbackOutput, saveError: save.error };
 }

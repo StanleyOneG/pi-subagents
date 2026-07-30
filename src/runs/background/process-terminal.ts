@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { writeAtomicJson, writePrivateAtomicJson } from "../../shared/atomic-json.ts";
+import { writePrivateAtomicJson } from "../../shared/atomic-json.ts";
+import { appendArtifact } from "../../shared/artifacts.ts";
 import {
 	SUBAGENT_LIFECYCLE_ARTIFACT_VERSION,
 	type AsyncStatus,
@@ -207,7 +208,7 @@ function overlayStatus(asyncDir: string, proof: ProcessTerminalV1, candidate?: P
 				step.processTerminal = stepProcessTerminalProof(proof, index, stepState, records, resumeDisposition(step.status, step.sessionFile ?? candidate?.sessionFile));
 			}
 		}
-		writeAtomicJson(statusPath, status);
+		writePrivateAtomicJson(statusPath, status);
 	} catch {
 		// The proof sidecar remains authoritative when terminal status is unavailable.
 	}
@@ -269,10 +270,10 @@ export function finalizeProcessTerminal(
 	}
 	let durable = false;
 	try {
-		writeAtomicJson(processTerminalPath(asyncDir), proof);
+		writePrivateAtomicJson(processTerminalPath(asyncDir), proof);
 		durable = true;
 		overlayStatus(asyncDir, proof, candidateForOverlay);
-		fs.appendFileSync(path.join(asyncDir, "events.jsonl"), `${JSON.stringify({ type: "subagent.run.process_terminal", lifecycleArtifactVersion: SUBAGENT_LIFECYCLE_ARTIFACT_VERSION, ts: Date.now(), runId, processTerminal: proof })}\n`, "utf-8");
+		appendArtifact(path.join(asyncDir, "events.jsonl"), `${JSON.stringify({ type: "subagent.run.process_terminal", lifecycleArtifactVersion: SUBAGENT_LIFECYCLE_ARTIFACT_VERSION, ts: Date.now(), runId, processTerminal: proof })}\n`);
 	} catch {
 		// Do not emit a process-terminal event when the proof sidecar was not durable.
 	}

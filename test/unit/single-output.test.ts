@@ -79,6 +79,22 @@ describe("resolveSingleOutputPath", () => {
 		const resolved = resolveSingleOutputPath("reviews/report.md", "/runtime", "/requested", "/repo/.pi-subagents/artifacts/outputs/run-1");
 		assert.equal(resolved, path.resolve("/repo/.pi-subagents/artifacts/outputs/run-1", "reviews/report.md"));
 	});
+
+	it("preserves normal traversal semantics for caller-owned relative output paths", () => {
+		const resolved = resolveSingleOutputPath("../reports/report.md", "/runtime", "/requested/work");
+		assert.equal(resolved, path.resolve("/requested/reports/report.md"));
+	});
+
+	it("rejects traversal from runtime-owned relative output paths", () => {
+		assert.throws(
+			() => resolveSingleOutputPath("../victim.md", "/runtime", "/requested", "/runtime/outputs/run-1"),
+			/Runtime-owned relative output path must not contain '\.\.'/,
+		);
+		assert.throws(
+			() => resolveSingleOutputPath("nested/../../victim.md", "/runtime", "/requested", "/runtime/outputs/run-1"),
+			/Runtime-owned relative output path must not contain '\.\.'/,
+		);
+	});
 });
 
 describe("injectSingleOutputInstruction", () => {
@@ -160,6 +176,44 @@ describe("resolveSingleOutput", () => {
 		assert.equal(result.fullOutput, "fallback output");
 		assert.equal(result.savedPath, undefined);
 		assert.match(result.saveError ?? "", /Failed to read changed output file/);
+	});
+
+	it("uses private no-follow writers for runtime-owned outputs", { skip: process.platform === "win32" ? "POSIX permissions/symlinks" : undefined }, () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-output-private-"));
+		tempDirs.push(root);
+		const runtimeRoot = path.join(root, "outputs");
+		const outputPath = path.join(runtimeRoot, "review", "report.md");
+		const before = captureSingleOutputSnapshot(outputPath, runtimeRoot);
+		const result = resolveSingleOutput(outputPath, "private receipt", before, runtimeRoot);
+
+		assert.equal(result.savedPath, outputPath);
+		assert.equal(fs.readFileSync(outputPath, "utf-8"), "private receipt");
+		assert.equal(fs.statSync(runtimeRoot).mode & 0o777, 0o700);
+		assert.equal(fs.statSync(path.dirname(outputPath)).mode & 0o777, 0o700);
+		assert.equal(fs.statSync(outputPath).mode & 0o777, 0o600);
+	});
+
+	it("rejects runtime-owned symlink and hard-link swaps without touching victims", { skip: process.platform === "win32" ? "POSIX links" : undefined }, () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-output-links-"));
+		tempDirs.push(root);
+		const runtimeRoot = path.join(root, "outputs");
+		const outputPath = path.join(runtimeRoot, "review.md");
+		const before = captureSingleOutputSnapshot(outputPath, runtimeRoot);
+		const victim = path.join(root, "victim.md");
+		fs.writeFileSync(victim, "external victim", "utf-8");
+		fs.unlinkSync(outputPath);
+		fs.linkSync(victim, outputPath);
+		const linked = resolveSingleOutput(outputPath, "must not overwrite", before, runtimeRoot);
+		assert.equal(linked.savedPath, undefined);
+		assert.match(linked.saveError ?? "", /Unsafe artifact file/);
+		assert.equal(fs.readFileSync(victim, "utf-8"), "external victim");
+
+		fs.unlinkSync(outputPath);
+		fs.symlinkSync(victim, outputPath);
+		const symlinked = resolveSingleOutput(outputPath, "must not overwrite", before, runtimeRoot);
+		assert.equal(symlinked.savedPath, undefined);
+		assert.match(symlinked.saveError ?? "", /Unsafe artifact file/);
+		assert.equal(fs.readFileSync(victim, "utf-8"), "external victim");
 	});
 });
 

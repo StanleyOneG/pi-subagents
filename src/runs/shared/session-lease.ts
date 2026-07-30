@@ -240,7 +240,7 @@ export function acquireSessionLease(request: SessionLeaseRequest, options: Sessi
 
 	for (let attempt = 0; attempt < 4; attempt++) {
 		if (createLeaseDirectory(leaseDir, owner)) {
-			const writeOwner = createAtomicJsonWriter();
+			const writeOwner = createAtomicJsonWriter({ mode: 0o600 });
 			return {
 				leaseDir,
 				owner,

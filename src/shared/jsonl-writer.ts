@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import { openPrivateArtifactForAppend } from "./artifacts.ts";
 
 export interface DrainableSource {
 	pause(): void;
@@ -35,7 +36,10 @@ export function createJsonlWriter(
 		};
 	}
 
-	const createWriteStream = deps.createWriteStream ?? ((targetPath: string) => fs.createWriteStream(targetPath, { flags: "a" }));
+	const createWriteStream = deps.createWriteStream ?? ((targetPath: string) => {
+		const fd = openPrivateArtifactForAppend(targetPath);
+		return fs.createWriteStream(targetPath, { fd, flags: "a", autoClose: true });
+	});
 	let stream: JsonlWriteStream | undefined;
 	try {
 		stream = createWriteStream(filePath);

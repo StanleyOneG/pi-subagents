@@ -699,7 +699,7 @@ Example:
 }
 ```
 
-Supported override fields are `model`, `fallbackModels`, `thinking`, `systemPromptMode`, `inheritProjectContext`, `inheritSkills`, `defaultContext`, `acceptanceRole`, `disabled`, `skills`, `tools`, and `systemPrompt`. Use `defaultContext: false` or `acceptanceRole: false` to clear an inherited override. Project overrides beat user overrides.
+Supported override fields are `model`, `fallbackModels`, `thinking`, `systemPromptMode`, `inheritProjectContext`, `inheritSkills`, `defaultContext`, `acceptanceRole`, `acceptanceCapability`, `disabled`, `skills`, `optionalSkills`, `requiredSkills`, `skillPath`, `tools`, `requiredTools`, `extensions`, `subagentOnlyExtensions`, and `systemPrompt`. Use `false` (or an empty string in management updates) to clear an inherited optional field. Project overrides beat user overrides.
 
 Set `subagents.defaultModel` to give all subagents without an explicit model their own default model, separate from the parent session model. Per-agent model overrides and agent frontmatter still win.
 
@@ -759,7 +759,7 @@ maxSubagentDepth: 1
 Your system prompt goes here.
 ```
 
-Simple-scalar list fields accept either the existing comma-separated form or a newline block list with one `- item` per line. This applies to `tools`, `defaultReads`, `skill`/`skills`, `skillPath`, `fallbackModels`, `extensions`, and `subagentOnlyExtensions`; for example:
+Simple-scalar list fields accept either the existing comma-separated form or a newline block list with one `- item` per line. This applies to `tools`, `requiredTools`, `defaultReads`, `skill`/`skills`, `optionalSkills`, `requiredSkills`, `skillPath`, `fallbackModels`, `extensions`, and `subagentOnlyExtensions`; for example:
 
 ```yaml
 tools:
@@ -780,13 +780,16 @@ Important fields:
 | `subagentOnlyExtensions` | Extension paths loaded only in spawned child sessions for this agent. Tools registered there are unavailable to the main agent unless also installed through normal Pi extension configuration. |
 | `model` | Default model. Bare ids prefer the current provider when possible, then unique registry matches. |
 | `fallbackModels` | Ordered backup models for provider/model failures such as quota, auth, timeout, or unavailable model. Ordinary task failures do not trigger fallback. |
-| `thinking` | Appended as a `:level` suffix at runtime unless a suffix is already present. |
+| `thinking` | Appended as a `:level` suffix at runtime unless a suffix is already present. `max` is accepted only when the resolved Pi model metadata explicitly advertises `thinkingLevelMap.max`. |
 | `systemPromptMode` | `replace` by default; `append` keeps Pi’s base prompt. |
 | `inheritProjectContext` | Keeps or strips inherited project instruction blocks. |
 | `inheritSkills` | Keeps or strips Pi’s discovered skills catalog. |
 | `defaultContext` | Optional `fresh` or `fork` launch context default for this agent. |
-| `skills` | Selects specific skills for the child, regardless of `inheritSkills`. |
-| `skillPath` | Invocation-private skill files or discovery directories. Relative paths resolve from the agent definition file. Local matches take precedence, while unresolved or unreadable matches fall back to normal skill discovery. This field discovers candidates only; `skills` still selects what the child receives. |
+| `skills` | Selects legacy best-effort skills for the child, regardless of `inheritSkills`; unresolved implicit names warn. Explicit per-run selections fail preflight when unavailable. |
+| `optionalSkills` | Best-effort role-card skills. Resolved skills are injected and recorded in provenance; missing names warn. |
+| `requiredSkills` | Role-card skills that must resolve before launch. Missing or unreadable requirements fail preflight. |
+| `skillPath` | Invocation-private skill files or discovery directories. Relative paths resolve from the agent definition file. Local matches take precedence, while unresolved or unreadable matches fall back to normal skill discovery. This field discovers candidates only; a skill selection field still chooses what the child receives. |
+| `requiredTools` | Tools that must be both permitted by `tools` and present in Pi's configured/active registry before launch. When registry metadata is unavailable, only Pi's documented builtins are assumed. |
 | `output` | Default single-agent output file. |
 | `defaultReads` | Files to read before running in chain/parallel behavior. |
 | `defaultProgress` | Maintain `progress.md`. |
@@ -794,8 +797,9 @@ Important fields:
 | `timeoutMs` | Positive integer default runtime deadline in milliseconds for single-agent launches. Foreground launches use 30 minutes when neither the call nor agent provides a timeout; explicit `timeoutMs`/`maxRuntimeMs` and agent defaults win. |
 | `turnBudget` | JSON object default such as `{"maxTurns":20,"graceTurns":2}` for single-agent launches. An explicit call value wins, followed by this agent default, then global `turnBudget` config. |
 | `acceptance` | Acceptance default for single-agent launches. Use a scalar level such as `checked` or an inline/block YAML map such as `{ level: "none", reason: "lightweight lookup" }`. Explicit call values win; chain and parallel acceptance remains task/step configuration. |
-| `acceptanceRole` | Optional `read-only` or `writer` role for automatic acceptance inference. Explicit task mutation or no-edit intent wins; otherwise the declared role replaces agent-name guessing. This does not grant or revoke tools. |
-| `completionGuard` | Set `false` only for non-implementation agents that may mention implementation words while using mutation-capable tools such as `bash`. |
+| `acceptanceRole` | Optional `read-only` or `writer` hint for automatic acceptance inference. Explicit task mutation or no-edit intent wins; otherwise the declared role replaces agent-name guessing. This does not grant or revoke tools. |
+| `acceptanceCapability` | Trusted role-card capability: `read-only` or `mutating`. It must agree with `acceptanceRole`; `read-only` requires an explicit tool allowlist without `write`, `edit`, or unrestricted `bash`, overrides mutation-looking prose, disables mutation completion guards, and enables explicit read-only evidence exemptions. |
+| `completionGuard` | Set `false` only for non-implementation agents that may mention implementation words while using mutation-capable tools such as `bash`. Trusted read-only capability disables this guard automatically. |
 | `interactive` | Parsed for compatibility but not enforced in v1. |
 | `maxSubagentDepth` | Tightens nested delegation for this agent's children. |
 | `memory` | Opt-in role-specific persistent memory. `memory: { scope: "project" \| "user", path: "<name>" }` injects the first lines of a `MEMORY.md` from a dedicated `agent-memory/` directory into the child system prompt. Agents with write tools (`edit`/`write`/`bash`) get a read-write block; read-only agents get a read-only fallback. Project scope resolves under `<project>/.pi/agent-memory/`, user scope under `~/.pi/agent/agent-memory/`. Paths are validated against traversal and symlink escape. |
@@ -1738,7 +1742,7 @@ Every run resolves an effective acceptance policy. Callers may omit `acceptance`
 }
 ```
 
-Acceptance evidence levels are `auto`, `none`, `attested`, `checked`, and `verified`. `acceptance: "auto"` is the default. Review is a separate gate configured with `acceptance.review`; async, risky, and dynamic writer contexts infer checked evidence plus `review: { agent: "reviewer", required: true }`. Read-only tasks infer lightweight attestation, while normal writer tasks infer checked evidence without review. Agent frontmatter or `subagents.agentOverrides` may set `acceptanceRole: "read-only" | "writer"` for ambiguous tasks; explicit task mutation or no-edit intent wins over that role, while omitted metadata preserves the existing reviewer/scout/worker name heuristics. The role affects acceptance inference only and does not change tool access. The bare string `"none"` is rejected; use `{ level: "none", reason: "..." }` instead. `acceptance: false` is accepted only as a deprecated shorthand for disabling gates.
+Acceptance evidence levels are `auto`, `none`, `attested`, `checked`, and `verified`. `acceptance: "auto"` is the default. Review is a separate gate configured with `acceptance.review`; async, risky, and dynamic writer contexts infer checked evidence plus `review: { agent: "reviewer", required: true }`. Read-only tasks infer lightweight attestation, while normal writer tasks infer checked evidence without review. Agent frontmatter or `subagents.agentOverrides` may set `acceptanceRole: "read-only" | "writer"` as an inference hint for ambiguous tasks; explicit task mutation or no-edit intent wins over that hint, while omitted metadata preserves existing name heuristics. Only explicit `acceptanceCapability: "read-only" | "mutating"` is trusted capability metadata: it must agree with the role hint and can enforce read-only tools/evidence even when task prose looks mutating. The bare string `"none"` is rejected; use `{ level: "none", reason: "..." }` instead. `acceptance: false` is accepted only as a deprecated shorthand for disabling gates.
 
 For reviewer/read-only calls, omit `acceptance`. The explicit value `"reviewed"` is not a policy level: it remains schema-recognized only so semantic preflight can explain the mistake without spawning a child. To require review of a writer result, use `acceptance: { level: "checked", review: { required: true, agent: "reviewer" } }` and orchestrate the reviewer separately.
 
@@ -1752,7 +1756,7 @@ Acceptance provenance is stored separately from child prose. `evidenceStatus` pr
 - `reviewed`: an independent reviewer result is present and has no blockers.
 - `rejected`: attestation, structural checks, verification, or review failed.
 
-For `attested` or stricter levels, the child prompt includes a standardized acceptance section and asks for a fenced `acceptance-report` JSON block. The parser canonicalizes known enum synonyms, snake_case report keys and wrappers, underscore fence tags, unambiguous scalar arrays, string booleans, and criterion-id separators. Unknown or ambiguous keys and enum values fail with field-level diagnostics. Explicit empty `changedFiles` and `testsAddedOrUpdated` arrays are recorded as not applicable; missing fields and empty required command or validation evidence still fail.
+For `attested` or stricter levels, the child prompt includes a standardized acceptance section and asks for a fenced `acceptance-report` JSON block. The parser canonicalizes known enum synonyms, snake_case report keys and wrappers, underscore fence tags, unambiguous scalar arrays, string booleans, and criterion-id separators. Unknown or ambiguous keys and enum values fail with field-level diagnostics. Empty `changedFiles` or `testsAddedOrUpdated` is accepted as not applicable only for a trusted read-only capability whose report explicitly lists the matching kind in `notApplicableEvidence`; otherwise empty or missing required evidence fails. A command result of `failed` or `not-run` always rejects. `expected-red` and `expected-failure` are accepted only for an explicitly named criterion whose `allowedCommandOutcomes` allow that exact result.
 
 Acceptance fences are removed from normal output artifacts, while the raw child transcript remains intact and per-child metadata stores the complete acceptance ledger and parsed report. Explicit failed gates fail the run. Inferred gates remain observable without failing the run.
 

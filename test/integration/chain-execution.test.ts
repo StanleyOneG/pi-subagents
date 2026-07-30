@@ -13,6 +13,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { MockPi } from "../support/helpers.ts";
 import {
 	createMockPi,
@@ -101,7 +102,14 @@ interface ChainResultItem {
 	error?: string;
 	attemptedModels?: string[];
 	skills?: string[];
-	acceptance?: { status?: string; verifyRuns?: Array<{ status?: string }>; childReport?: unknown; runtimeChecks?: Array<{ status?: string; id?: string }> };
+	acceptance?: {
+		status?: string;
+		verifyRuns?: Array<{ status?: string }>;
+		childReport?: { commandsRun?: Array<{ result?: string }>; notApplicableEvidence?: string[] };
+		runtimeChecks?: Array<{ status?: string; id?: string }>;
+		effectiveAcceptance?: { context?: { capability?: string; notApplicableEvidence?: string[] } };
+	};
+	resourceProvenance?: Array<{ name?: string; path?: string; source?: string; required?: boolean }>;
 }
 
 interface ChainExecutionResult {
@@ -125,7 +133,12 @@ interface ChainExecutionModule {
 	executeChain(params: Record<string, unknown>): Promise<ChainExecutionResult>;
 }
 
+interface ChainSerializerModule {
+	parseChain(content: string, source: "project", filePath: string): { name: string; steps: TestChainStep[] };
+}
+
 const chainMod = await tryImport<ChainExecutionModule>("./src/runs/foreground/chain-execution.ts");
+const chainSerializerMod = await tryImport<ChainSerializerModule>("./src/agents/chain-serializer.ts");
 const available = !!chainMod;
 const executeChain = chainMod?.executeChain;
 
@@ -213,6 +226,102 @@ describe("chain execution — sequential", { skip: !available ? "pi packages not
 			`---\nname: ${skillName}\ndescription: test skill\n---\nbody\n`,
 			"utf-8",
 		);
+	}
+
+	const stanToolNames = [
+		"read", "write", "edit", "bash", "grep", "find", "ls",
+		"retrieve_memory", "retrieve_project_state_snapshot", "propose_memory", "search_sessions",
+	];
+
+	function makeStanV070Agents(): ReturnType<typeof makeAgent>[] {
+		const readOnlyTools = ["read", "grep", "find", "ls", "retrieve_memory", "retrieve_project_state_snapshot", "propose_memory", "search_sessions"];
+		const mutatingTools = ["read", "write", "edit", "bash", "grep", "find", "ls", "retrieve_memory", "retrieve_project_state_snapshot", "propose_memory", "search_sessions"];
+		return [
+			makeAgent("stan-architect", {
+				tools: readOnlyTools,
+				requiredTools: ["read", "grep", "find", "ls", "retrieve_project_state_snapshot", "retrieve_memory"],
+				requiredSkills: ["load-project-state", "plan-code-change", "accept-task", "codeguard", "trace-work"],
+				acceptanceCapability: "read-only",
+				systemPromptMode: "replace",
+				inheritProjectContext: true,
+				inheritSkills: true,
+				defaultContext: "fresh",
+				maxSubagentDepth: 0,
+			}),
+			makeAgent("stan-reviewer", {
+				tools: readOnlyTools,
+				requiredTools: ["read", "grep", "find", "ls", "retrieve_project_state_snapshot", "retrieve_memory"],
+				requiredSkills: ["load-project-state", "review-plan", "review-diff-before-final", "codeguard", "codeguard-reviewer", "trace-work"],
+				acceptanceCapability: "read-only",
+				systemPromptMode: "replace",
+				inheritProjectContext: true,
+				inheritSkills: true,
+				defaultContext: "fresh",
+				maxSubagentDepth: 0,
+			}),
+			makeAgent("stan-test-engineer", {
+				tools: mutatingTools,
+				requiredTools: ["read", "write", "edit", "bash", "grep", "retrieve_project_state_snapshot", "retrieve_memory"],
+				requiredSkills: ["load-project-state", "write-gate-tests", "validate-code-change", "accept-task", "trace-work"],
+				acceptanceCapability: "mutating",
+				systemPromptMode: "replace",
+				inheritProjectContext: true,
+				inheritSkills: true,
+				defaultContext: "fork",
+				maxSubagentDepth: 0,
+			}),
+			makeAgent("stan-dev", {
+				tools: mutatingTools,
+				requiredTools: ["read", "write", "edit", "bash", "grep", "retrieve_project_state_snapshot", "retrieve_memory"],
+				requiredSkills: ["load-project-state", "implement-code-change", "validate-code-change", "accept-task", "dependency-change", "codeguard", "trace-work"],
+				acceptanceCapability: "mutating",
+				systemPromptMode: "replace",
+				inheritProjectContext: true,
+				inheritSkills: true,
+				defaultContext: "fork",
+				maxSubagentDepth: 0,
+			}),
+			makeAgent("stan-qa-evaluator", {
+				tools: readOnlyTools,
+				requiredTools: ["read", "grep", "find", "ls", "retrieve_project_state_snapshot", "retrieve_memory"],
+				requiredSkills: ["load-project-state", "evaluate-golden", "accept-task", "codeguard", "trace-work"],
+				acceptanceCapability: "read-only",
+				systemPromptMode: "replace",
+				inheritProjectContext: true,
+				inheritSkills: true,
+				defaultContext: "fresh",
+				completionGuard: false,
+				maxSubagentDepth: 0,
+			}),
+		];
+	}
+
+	function writeStanSkillFixtures(agents: ReturnType<typeof makeAgent>[]): void {
+		const names = new Set(agents.flatMap((agent) => agent.requiredSkills ?? []));
+		for (const name of names) {
+			const skillDir = path.join(tempDir, ".pi", "skills", name);
+			fs.mkdirSync(skillDir, { recursive: true });
+			fs.writeFileSync(path.join(skillDir, "SKILL.md"), `---\nname: ${name}\ndescription: Stan v0.7.0 integration fixture\n---\nfixture\n`, "utf-8");
+		}
+	}
+
+	function parseStanV070Chain(): { name: string; steps: TestChainStep[] } {
+		assert.ok(chainSerializerMod, "chain serializer should be importable");
+		const chainPath = fileURLToPath(new URL("../fixtures/stan-v0.7.0/stan-standard-tdd-change.chain.md", import.meta.url));
+		return chainSerializerMod.parseChain(fs.readFileSync(chainPath, "utf-8"), "project", chainPath);
+	}
+
+	function fencedStanReport(report: Record<string, unknown>, verdict = "PASS"): string {
+		return `${verdict}\n\n\`\`\`acceptance-report\n${JSON.stringify(report)}\n\`\`\``;
+	}
+
+	function stanReadOnlyReport(evidence: string, verdict = "PASS"): string {
+		return fencedStanReport({
+			criteriaSatisfied: [{ id: "criterion-1", status: "satisfied", evidence }],
+			reviewFindings: [evidence],
+			residualRisks: [],
+			notApplicableEvidence: ["changed-files", "tests-added"],
+		}, verdict);
 	}
 
 	it("runs a 2-step chain", async () => {
@@ -1078,6 +1187,143 @@ describe("chain execution — sequential", { skip: !available ? "pi packages not
 		assert.ok(result.isError, "chain should fail");
 		assert.equal(result.details.results.length, 1, "only step1 should have run");
 		assert.equal(result.details.results[0].exitCode, 1);
+	});
+
+	it("preserves a read-only reviewer's semantic BLOCKED verdict through chain rendering", async () => {
+		mockPi.onCall({ output: `BLOCKED
+
+Scope handled: final diff review
+Finding: blocker in src/security.ts:42
+\`\`\`acceptance-report
+{"criteriaSatisfied":[{"id":"criterion-1","status":"satisfied","evidence":"Concrete blocker with file and line"}],"reviewFindings":["blocker: src/security.ts:42 - unsafe trust boundary"],"residualRisks":["unsafe trust boundary remains"]}
+\`\`\`` });
+		const agents = [makeAgent("stan-reviewer", {
+			acceptanceRole: "read-only",
+			acceptanceCapability: "read-only",
+			tools: ["read"],
+			completionGuard: false,
+		})];
+
+		const result = await executeChain(makeChainParams(
+			[{ agent: "stan-reviewer", task: "Review the supplied diff without edits" }],
+			agents,
+		));
+
+		assert.equal(result.isError, undefined);
+		assert.equal(result.details.results[0]?.acceptance?.status, "attested");
+		assert.match(result.details.results[0]?.finalOutput ?? "", /^BLOCKED\b/);
+		assert.match(result.content[0]?.text ?? "", /BLOCKED/);
+		assert.doesNotMatch(result.content[0]?.text ?? "", /commands-run evidence missing/);
+	});
+
+	it("executes the exact Stan v0.7.0 TDD chain with resource, read-only, and expected-RED evidence", async () => {
+		const parsed = parseStanV070Chain();
+		assert.equal(parsed.name, "stan-standard-tdd-change");
+		assert.equal(parsed.steps.length, 6);
+		assert.deepEqual(parsed.steps[2]?.acceptance, {
+			level: "checked",
+			criteria: [{
+				id: "tdd-red-gate",
+				must: "The focused regression test demonstrates the current defect before implementation.",
+				evidence: ["tests-added", "commands-run"],
+				severity: "required",
+				allowedCommandOutcomes: ["expected-red", "expected-failure"],
+			}],
+			evidence: ["tests-added", "commands-run", "residual-risks"],
+		});
+
+		const agents = makeStanV070Agents();
+		writeStanSkillFixtures(agents);
+		mockPi.onCall({ output: stanReadOnlyReport("Plan is scoped and includes ACs, risks, and a TDD gate.") });
+		mockPi.onCall({ output: stanReadOnlyReport("Plan review found no blockers.") });
+		const gateReport = fencedStanReport({
+			criteriaSatisfied: [{ id: "tdd-red-gate", status: "satisfied", evidence: "Focused regression test failed before implementation for the intended assertion." }],
+			changedFiles: ["test/regression.test.ts"],
+			testsAddedOrUpdated: ["test/regression.test.ts"],
+			commandsRun: [{
+				command: "npm test -- regression",
+				result: "expected-red",
+				summary: "Expected assertion failed before production fix.",
+				expected: { kind: "expected-red", gateId: "tdd-red-gate", reason: "TDD red gate before implementation" },
+			}],
+			validationOutput: ["1 focused expected RED"],
+			residualRisks: [],
+			noStagedFiles: true,
+		});
+		mockPi.onCall({ jsonl: [...events.completedWrite(path.join(tempDir, "test", "regression.test.ts"), "test mutation evidence\n"), events.assistantMessage(gateReport)] });
+		const implementationReport = fencedStanReport({
+			criteriaSatisfied: [{ id: "criterion-1", status: "satisfied", evidence: "Implemented only the approved scope." }],
+			changedFiles: ["src/fix.ts"],
+			testsAddedOrUpdated: ["test/regression.test.ts"],
+			commandsRun: [{ command: "npm test -- regression", result: "passed", summary: "Focused test passed after implementation." }],
+			validationOutput: ["1 focused test passed"],
+			residualRisks: [],
+			noStagedFiles: true,
+		});
+		mockPi.onCall({ jsonl: [...events.completedWrite(path.join(tempDir, "src", "fix.ts"), "implementation evidence\n"), events.assistantMessage(implementationReport)] });
+		mockPi.onCall({ output: stanReadOnlyReport("QA consumed supplied validation actions and found no blockers.") });
+		mockPi.onCall({ output: stanReadOnlyReport("Final diff review found no blockers and preserved scope.") });
+
+		const result = await executeChain(makeChainParams(parsed.steps, agents, {
+			task: "Implement a narrow regression fix using the exact Stan v0.7.0 TDD flow.",
+			availableToolNames: stanToolNames,
+			chainDir: path.join(tempDir, "chain-run"),
+			maxSubagentDepth: 2,
+		}));
+
+		assert.equal(result.isError, undefined, JSON.stringify(result.content));
+		assert.equal(mockPi.callCount(), 6);
+		assert.deepEqual(result.details.results.map((item) => item.acceptance?.status), [
+			"attested", "attested", "checked", "checked", "attested", "attested",
+		]);
+		assert.equal(result.details.results[2]?.acceptance?.childReport?.commandsRun?.[0]?.result, "expected-red");
+		assert.equal(result.details.results[2]?.acceptance?.runtimeChecks?.find((check) => check.id === "command:1")?.status, "passed");
+		assert.ok(result.details.results.every((item) => (item.resourceProvenance?.length ?? 0) > 0));
+		for (const index of [0, 1, 4, 5]) {
+			assert.equal(result.details.results[index]?.acceptance?.effectiveAcceptance?.context?.capability, "read-only");
+			assert.deepEqual(result.details.results[index]?.acceptance?.childReport?.notApplicableEvidence, ["changed-files", "tests-added"]);
+		}
+		assert.match(result.content[0]?.text ?? "", /Chain completed/);
+	});
+
+	it("preserves BLOCKED from the exact Stan v0.7.0 read-only plan-review prefix", async () => {
+		const parsed = parseStanV070Chain();
+		const agents = makeStanV070Agents();
+		writeStanSkillFixtures(agents);
+		mockPi.onCall({ output: stanReadOnlyReport("Plan is scoped and ready for review.") });
+		mockPi.onCall({ output: stanReadOnlyReport("Required rollback evidence is missing.", "BLOCKED") });
+
+		const result = await executeChain(makeChainParams(parsed.steps.slice(0, 2), agents, {
+			task: "Review a narrow Stan change plan.",
+			availableToolNames: stanToolNames,
+			chainDir: path.join(tempDir, "blocked-chain-run"),
+			maxSubagentDepth: 2,
+		}));
+
+		assert.equal(result.isError, undefined, JSON.stringify(result.content));
+		assert.equal(mockPi.callCount(), 2);
+		assert.equal(result.details.results[1]?.acceptance?.status, "attested");
+		assert.match(result.details.results[1]?.finalOutput ?? "", /^BLOCKED\b/);
+		assert.match(result.content[0]?.text ?? "", /BLOCKED/);
+		assert.doesNotMatch(result.content[0]?.text ?? "", /Acceptance rejected|commands-run evidence missing/);
+	});
+
+	it("keeps legacy chain agent skills best effort while explicit step skills fail closed", async () => {
+		mockPi.onCall({ output: "Legacy skill warning did not block" });
+		const legacy = await executeChain(makeChainParams(
+			[{ agent: "worker", task: "Inspect" }],
+			[makeAgent("worker", { skills: ["missing-legacy-chain-skill"], completionGuard: false })],
+		));
+		assert.equal(legacy.isError, undefined);
+		assert.match((legacy.details.results[0] as ChainResultItem & { skillsWarning?: string }).skillsWarning ?? "", /missing-legacy-chain-skill/);
+
+		const explicit = await executeChain(makeChainParams(
+			[{ agent: "worker", task: "Inspect", skill: ["missing-explicit-chain-skill"] }],
+			[makeAgent("worker", { completionGuard: false })],
+		));
+		assert.equal(explicit.isError, true);
+		assert.match(explicit.details.results[0]?.error ?? "", /missing-explicit-chain-skill/);
+		assert.equal(mockPi.callCount(), 1, "explicit missing skill must fail before a second model launch");
 	});
 
 	it("agent contract v1 chain defaults to execution gating after acceptance rejection", async () => {

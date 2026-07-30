@@ -97,4 +97,27 @@ describe("async runner execution", () => {
 		assert.ok("steps" in result, "expected successful step build");
 		assert.deepEqual(result.steps[0]?.toolBudget, { hard: 5, block: ["ls"] });
 	});
+
+	it("carries captured Pi tool registry names through async resource preflight", () => {
+		const custom = "agent_browser";
+		const role: AgentConfig = { ...agent("stan-worker"), tools: [custom], requiredTools: [custom] };
+		const available = buildAsyncRunnerSteps("run-custom-tools", {
+			chain: [{ agent: "stan-worker", task: "Inspect" }],
+			agents: [role],
+			ctx: { ...ctx, availableToolNames: [custom] },
+			asyncDir: path.join(process.cwd(), ".tmp-async-test"),
+			maxSubagentDepth: 2,
+		});
+		assert.ok("steps" in available, "registered custom tool should pass async preflight");
+
+		const missing = buildAsyncRunnerSteps("run-missing-custom-tool", {
+			chain: [{ agent: "stan-worker", task: "Inspect" }],
+			agents: [role],
+			ctx: { ...ctx, availableToolNames: [] },
+			asyncDir: path.join(process.cwd(), ".tmp-async-test"),
+			maxSubagentDepth: 2,
+		});
+		assert.ok("error" in missing, "missing registry tool must reject async launch before spawning");
+		assert.match(missing.error, /agent_browser/);
+	});
 });

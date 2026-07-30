@@ -189,6 +189,10 @@ describe("builtin agent overrides", () => {
 						inheritProjectContext: true,
 						inheritSkills: true,
 						acceptanceRole: "writer",
+						acceptanceCapability: "mutating",
+						requiredSkills: ["review-plan"],
+						optionalSkills: ["codeguard"],
+						requiredTools: ["read"],
 						subagentOnlyExtensions: ["./tools/child-review.ts"],
 						completionGuard: false,
 					},
@@ -205,6 +209,10 @@ describe("builtin agent overrides", () => {
 		assert.equal(reviewer.inheritProjectContext, true);
 		assert.equal(reviewer.inheritSkills, true);
 		assert.equal(reviewer.acceptanceRole, "writer");
+		assert.equal(reviewer.acceptanceCapability, "mutating");
+		assert.deepEqual(reviewer.requiredSkills, ["review-plan"]);
+		assert.deepEqual(reviewer.optionalSkills, ["codeguard"]);
+		assert.deepEqual(reviewer.requiredTools, ["read"]);
 		assert.deepEqual(reviewer.subagentOnlyExtensions, ["./tools/child-review.ts"]);
 		assert.equal(reviewer.completionGuard, false);
 		assert.equal(reviewer.override?.scope, "user");
@@ -604,7 +612,7 @@ describe("builtin agent overrides", () => {
 		);
 	});
 
-	it("surfaces malformed acceptance role override values", () => {
+	it("surfaces malformed or conflicting acceptance contract override values", () => {
 		const settingsPath = path.join(tempHome, ".pi", "agent", "settings.json");
 		writeJson(settingsPath, {
 			subagents: {
@@ -622,6 +630,40 @@ describe("builtin agent overrides", () => {
 				&& error.message.includes(settingsPath)
 				&& error.message.includes("reviewer")
 				&& error.message.includes("acceptanceRole"),
+		);
+
+		writeJson(settingsPath, {
+			subagents: {
+				agentOverrides: {
+					reviewer: { acceptanceRole: "writer", acceptanceCapability: "read-only" },
+				},
+			},
+		});
+		assert.throws(
+			() => discoverAgents(tempProject, "both"),
+			(error: unknown) => error instanceof Error
+				&& error.message.includes(settingsPath)
+				&& error.message.includes("conflicting 'acceptanceCapability' and 'acceptanceRole'"),
+		);
+	});
+
+	it("rejects settings overrides that conflict with custom-agent acceptance metadata", () => {
+		const settingsPath = path.join(tempHome, ".pi", "agent", "settings.json");
+		writeProjectAgent(tempProject, "contract-reviewer", `---\nname: contract-reviewer\ndescription: Contract reviewer\nacceptanceCapability: read-only\ntools: read\n---\n\nReview only.\n`);
+		writeJson(settingsPath, {
+			subagents: {
+				agentOverrides: {
+					"contract-reviewer": { acceptanceRole: "writer" },
+				},
+			},
+		});
+
+		assert.throws(
+			() => discoverAgents(tempProject, "both"),
+			(error: unknown) => error instanceof Error
+				&& error.message.includes(settingsPath)
+				&& error.message.includes("contract-reviewer")
+				&& error.message.includes("effective acceptanceCapability 'read-only'"),
 		);
 	});
 

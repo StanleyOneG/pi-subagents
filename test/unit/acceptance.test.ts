@@ -155,6 +155,23 @@ describe("acceptance gates", () => {
 		assert.equal(dynamicReviewer.review && dynamicReviewer.review !== false ? dynamicReviewer.review.required : undefined, true);
 	});
 
+	it("lets trusted read-only capability override mutation-looking planner and reviewer prose", () => {
+		for (const { agentName, task } of [
+			{ agentName: "stan-architect", task: "Use plan-code-change to create a concise implementation plan with tests" },
+			{ agentName: "stan-reviewer", task: "Review what the implementation must patch without running commands" },
+		]) {
+			const resolved = resolveEffectiveAcceptance({
+				agentName,
+				acceptanceCapability: "read-only",
+				task,
+				mode: "chain",
+			});
+			assert.equal(resolved.level, "attested", agentName);
+			assert.deepEqual(resolved.inferredReason, ["declared read-only capability"]);
+			assert.deepEqual(resolved.evidence, ["review-findings", "residual-risks"]);
+		}
+	});
+
 	it("preserves risky keyword review inference when acceptance role metadata is omitted", () => {
 		for (const task of ["Inspect the security posture", "Read-only security audit"]) {
 			const resolved = resolveEffectiveAcceptance({ agentName: "worker", task });
@@ -502,7 +519,7 @@ describe("acceptance gates", () => {
 			commandsRun: [{ command: "npm test", exitCode: 0 }],
 		}));
 		assert.equal(invalidCommandReport.report, undefined);
-		assert.match(invalidCommandReport.error ?? "", /commandsRun\[0\]\.result: expected one of "passed", "failed", "not-run"; got missing/);
+		assert.match(invalidCommandReport.error ?? "", /commandsRun\[0\]\.result: expected one of "passed", "failed", "not-run", "expected-red", "expected-failure"; got missing/);
 		assert.match(invalidCommandReport.error ?? "", /commandsRun\[0\]\.summary: expected non-empty string; got missing/);
 
 		const invalidCriteriaReport = parseAcceptanceReport(report({
@@ -512,6 +529,125 @@ describe("acceptance gates", () => {
 		assert.match(invalidCriteriaReport.error ?? "", /criteriaSatisfied\[0\]\.id: expected string; got number 7/);
 		assert.match(invalidCriteriaReport.error ?? "", /criteriaSatisfied\[0\]\.status: expected one of "satisfied", "not-satisfied", "not-applicable"; got "maybe"/);
 		assert.match(invalidCriteriaReport.error ?? "", /criteriaSatisfied\[0\]\.evidence: expected non-empty string; got ""/);
+	});
+
+	it("permits expected RED/failure command outcomes only through their named required gate", async () => {
+		const cwd = tempRepo();
+		try {
+			const explicit = {
+				level: "checked" as const,
+				criteria: [{
+					id: "tdd-red-gate",
+					must: "The focused regression test demonstrates the current defect.",
+					evidence: ["commands-run" as const],
+					severity: "required" as const,
+					allowedCommandOutcomes: ["expected-red" as const, "expected-failure" as const],
+				}],
+			};
+			assert.deepEqual(validateAcceptanceInput(explicit), []);
+			const acceptance = resolveEffectiveAcceptance({ agentName: "worker", task: "Add a regression test first", explicit });
+			assert.deepEqual(acceptance.criteria[0]?.allowedCommandOutcomes, ["expected-red", "expected-failure"]);
+			assert.match(formatAcceptancePrompt(acceptance), /tdd-red-gate: expected-red, expected-failure/);
+			assert.match(formatAcceptancePrompt(acceptance), /expected: \{ kind, gateId, reason \}/);
+
+			for (const result of ["expected-red", "expected-failure"] as const) {
+				const ledger = await evaluateAcceptance({
+					acceptance,
+					output: report({
+						criteriaSatisfied: [{ id: "tdd-red-gate", status: "satisfied", evidence: "observed the intended pre-implementation failure" }],
+						commandsRun: [{
+							command: "npm test -- regression",
+							result,
+							summary: "fails before the production fix",
+							expected: { kind: result, gateId: "tdd-red-gate", reason: "TDD gate" },
+						}],
+					}),
+					cwd,
+				});
+				assert.equal(ledger.status, "checked", result);
+			}
+
+			const wrongGate = await evaluateAcceptance({
+				acceptance,
+				output: report({
+					criteriaSatisfied: [{ id: "tdd-red-gate", status: "satisfied", evidence: "reported" }],
+					commandsRun: [{
+						command: "npm test -- regression",
+						result: "expected-red",
+						summary: "fails",
+						expected: { kind: "expected-red", gateId: "wrong-gate", reason: "TDD gate" },
+					}],
+				}),
+				cwd,
+			});
+			assert.equal(wrongGate.status, "rejected");
+			assert.match(acceptanceFailureMessage(wrongGate) ?? "", /without exactly one required command-evidence gate/);
+
+			const ordinaryFailure = await evaluateAcceptance({
+				acceptance,
+				output: report({
+					criteriaSatisfied: [{ id: "tdd-red-gate", status: "satisfied", evidence: "reported" }],
+					commandsRun: [{ command: "npm test -- regression", result: "failed", summary: "unexpected infrastructure failure" }],
+				}),
+				cwd,
+			});
+			assert.equal(ordinaryFailure.status, "rejected");
+			assert.match(acceptanceFailureMessage(ordinaryFailure) ?? "", /reported failed/);
+
+			const attested = resolveEffectiveAcceptance({ agentName: "reviewer", task: "Review only", explicit: "attested" });
+			const lowerLevelFailure = await evaluateAcceptance({
+				acceptance: attested,
+				output: report({ commandsRun: [{ command: "npm test", result: "failed", summary: "unexpected failure" }] }),
+				cwd,
+			});
+			assert.equal(lowerLevelFailure.status, "rejected", "supplied failures must remain fail-closed below checked");
+
+			const disabled = resolveEffectiveAcceptance({
+				agentName: "worker",
+				task: "Do work",
+				explicit: { level: "none", reason: "legacy compatibility" },
+			});
+			const disabledFailure = await evaluateAcceptance({
+				acceptance: disabled,
+				output: report({ commandsRun: [{ command: "npm test", result: "not-run", summary: "tool unavailable" }] }),
+				cwd,
+			});
+			assert.equal(disabledFailure.status, "rejected", "disabled gates must not conceal voluntarily reported command failures");
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("parses trusted read-only not-applicable evidence without letting callers self-declare capability", async () => {
+		const errors = validateAcceptanceInput({
+			level: "checked",
+			context: { capability: "read-only", notApplicableEvidence: ["changed-files", "tests-added"] },
+		});
+		assert.match(errors.join("\n"), /context\.capability is reserved for trusted agent role cards/);
+
+		const acceptance = resolveEffectiveAcceptance({
+			agentName: "reviewer",
+			acceptanceRole: "read-only",
+			acceptanceCapability: "read-only",
+			task: "Review the implementation without edits",
+			explicit: { level: "checked", context: { notApplicableEvidence: ["changed-files", "tests-added"] } },
+		});
+		assert.deepEqual(acceptance.context, {
+			capability: "read-only",
+			notApplicableEvidence: ["changed-files", "tests-added"],
+		});
+		const parsed = parseAcceptanceReport(report({
+			changedFiles: [],
+			testsAddedOrUpdated: [],
+			notApplicableEvidence: ["changed-files", "tests-added"],
+		}));
+		assert.deepEqual(parsed.report?.notApplicableEvidence, ["changed-files", "tests-added"]);
+	});
+
+	it("validates expected command outcome configuration and report metadata", () => {
+		assert.match(validateAcceptanceInput({ criteria: [{ id: "red", must: "show RED", allowedCommandOutcomes: ["failed"] }] }).join("\n"), /must be expected-red or expected-failure/);
+		assert.match(parseAcceptanceReport(report({ commandsRun: [{ command: "npm test", result: "expected-red", summary: "red" }] })).error ?? "", /commandsRun\[0\]\.expected/);
+		assert.match(parseAcceptanceReport(report({ commandsRun: [{ command: "npm test", result: "passed", summary: "green", expected: { kind: "expected-red", gateId: "red", reason: "no" } }] })).error ?? "", /expected is only valid/);
 	});
 
 	it("explicit none disables inferred gates when a reason is present", () => {
@@ -525,23 +661,67 @@ describe("acceptance gates", () => {
 		assert.deepEqual(acceptance.evidence, []);
 	});
 
-	it("checked mode accepts explicit empty changed and test arrays as not applicable", async () => {
+	it("allows explicit not-applicable mutation evidence only for trusted read-only roles", async () => {
+		const cwd = tempRepo();
+		try {
+			const reviewerAcceptance = resolveEffectiveAcceptance({
+				agentName: "reviewer",
+				acceptanceCapability: "read-only",
+				task: "Review the implementation without edits",
+				explicit: { level: "checked" },
+			});
+			const reviewerLedger = await evaluateAcceptance({
+				acceptance: reviewerAcceptance,
+				output: report({
+					changedFiles: [],
+					testsAddedOrUpdated: [],
+					notApplicableEvidence: ["changed-files", "tests-added"],
+				}),
+				cwd,
+			});
+			assert.equal(reviewerLedger.status, "checked");
+			assert.equal(reviewerLedger.runtimeChecks.find((check) => check.id === "evidence:changed-files")?.status, "not-applicable");
+			assert.equal(reviewerLedger.runtimeChecks.find((check) => check.id === "evidence:tests-added")?.status, "not-applicable");
+
+			for (const acceptance of [
+				resolveEffectiveAcceptance({ agentName: "worker", acceptanceCapability: "mutating", task: "Implement a fix", explicit: { level: "checked" } }),
+				resolveEffectiveAcceptance({
+					agentName: "custom-agent",
+					task: "Inspect the change",
+					explicit: { level: "checked", context: { notApplicableEvidence: ["changed-files", "tests-added"] } },
+				}),
+			]) {
+				const ledger = await evaluateAcceptance({
+					acceptance,
+					output: report({ changedFiles: [], testsAddedOrUpdated: [], notApplicableEvidence: ["changed-files", "tests-added"] }),
+					cwd,
+				});
+				assert.equal(ledger.status, "rejected");
+				assert.match(acceptanceFailureMessage(ledger) ?? "", /changed-files evidence missing/);
+			}
+		} finally {
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects observed mutation attempts for trusted read-only acceptance", async () => {
 		const cwd = tempRepo();
 		try {
 			const acceptance = resolveEffectiveAcceptance({
-				agentName: "worker",
-				task: "Implement a fix",
+				agentName: "reviewer",
+				acceptanceCapability: "read-only",
+				task: "Review the patch without edits",
 				explicit: { level: "checked" },
 			});
-			const ledger = await evaluateAcceptance({
-				acceptance,
-				output: report({ changedFiles: [], testsAddedOrUpdated: [] }),
-				cwd,
+			const output = report({
+				changedFiles: [],
+				testsAddedOrUpdated: [],
+				notApplicableEvidence: ["changed-files", "tests-added"],
 			});
-
-			assert.equal(ledger.status, "checked");
-			assert.equal(ledger.runtimeChecks.find((check) => check.id === "evidence:changed-files")?.status, "not-applicable");
-			assert.equal(ledger.runtimeChecks.find((check) => check.id === "evidence:tests-added")?.status, "not-applicable");
+			assert.equal((await evaluateAcceptance({ acceptance, output, cwd, observedMutationAttempt: false })).status, "checked");
+			const mutating = await evaluateAcceptance({ acceptance, output, cwd, observedMutationAttempt: true });
+			assert.equal(mutating.status, "rejected");
+			assert.match(acceptanceFailureMessage(mutating) ?? "", /Read-only acceptance capability was violated/);
 		} finally {
 			fs.rmSync(cwd, { recursive: true, force: true });
 		}
@@ -559,7 +739,7 @@ describe("acceptance gates", () => {
 			assert.match(acceptanceFailureMessage(missing) ?? "", /changed-files evidence missing/);
 
 			const missingTests = await evaluateAcceptance({ acceptance, output: report({
-				changedFiles: [],
+				changedFiles: ["src/file.ts"],
 				testsAddedOrUpdated: undefined,
 			}), cwd });
 			assert.equal(missingTests.status, "rejected");
@@ -567,7 +747,7 @@ describe("acceptance gates", () => {
 
 			const emptyCommands = await evaluateAcceptance({
 				acceptance,
-				output: report({ changedFiles: [], testsAddedOrUpdated: [], commandsRun: [] }),
+				output: report({ changedFiles: ["src/file.ts"], testsAddedOrUpdated: ["test/file.test.ts"], commandsRun: [] }),
 				cwd,
 			});
 			assert.equal(emptyCommands.status, "rejected");
@@ -611,8 +791,8 @@ describe("acceptance gates", () => {
 				acceptance,
 				output: report({
 					criteriaSatisfied: [{ id: "release check", status: "met", evidence: "verified" }],
-					changedFiles: [],
-					testsAddedOrUpdated: [],
+					changedFiles: ["src/file.ts"],
+					testsAddedOrUpdated: ["test/file.test.ts"],
 				}),
 				cwd,
 			});

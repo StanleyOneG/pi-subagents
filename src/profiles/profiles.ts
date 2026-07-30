@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { BUILTIN_AGENT_NAMES } from "../agents/agents.ts";
-import { findModelInfo, getSupportedThinkingLevels, splitKnownThinkingSuffix, toModelInfo } from "../shared/model-info.ts";
+import { assertMaxThinkingSuffixSupported, findModelInfo, getSupportedThinkingLevels, resolveEffectiveThinking, splitKnownThinkingSuffix, toModelInfo } from "../shared/model-info.ts";
 import { getAgentDir } from "../shared/utils.ts";
 
 export const DEFAULT_PROVIDER_MODELS_MAX_AGE_DAYS = 7;
@@ -18,6 +18,7 @@ export type RecommendedRoleTier = "cheap" | "medium" | "strong";
 
 interface ProfileAgentOverride {
 	model?: string;
+	thinking?: string | false;
 }
 
 export interface SubagentProfileFile {
@@ -133,6 +134,10 @@ function validateSubagentProfile(filePath: string, parsed: Record<string, unknow
 		const model = (value as Record<string, unknown>).model;
 		if (model !== undefined && typeof model !== "string") {
 			throw new Error(`Profile '${filePath}' has invalid model for '${name}'; expected a string.`);
+		}
+		const thinking = (value as Record<string, unknown>).thinking;
+		if (thinking !== undefined && thinking !== false && typeof thinking !== "string") {
+			throw new Error(`Profile '${filePath}' has invalid thinking for '${name}'; expected a string or false.`);
 		}
 	}
 	return parsed as unknown as SubagentProfileFile;
@@ -613,22 +618,43 @@ export async function checkSubagentProfile(
 	const { filePath, profile } = readSubagentProfile(name);
 	const availableModels = ctx.modelRegistry.getAvailable().map(toModelInfo);
 	const entries = Object.entries(profile.subagents.agentOverrides)
-		.filter(([, value]) => typeof value?.model === "string" && value.model.trim())
-		.map(([agent, value]) => ({ agent, model: value.model!.trim() }));
+		.filter(([, value]) => (typeof value?.model === "string" && value.model.trim()) || value?.thinking === "max")
+		.map(([agent, value]) => ({
+			agent,
+			model: typeof value.model === "string" && value.model.trim() ? value.model.trim() : undefined,
+			thinking: value.thinking,
+		}));
 	const probeCache = new Map<string, { status: ProbeStatus; message?: string }>();
 	const results: ProfileCheckResult["results"] = [];
 	for (const entry of entries) {
+		const displayModel = entry.model ?? "(inherit)";
 		const modelInfo = findModelInfo(entry.model, availableModels);
-		const { thinkingSuffix } = splitKnownThinkingSuffix(entry.model);
-		const probeModelId = modelInfo ? `${modelInfo.fullId}${thinkingSuffix}` : entry.model;
-		let probe = probeCache.get(probeModelId);
-		if (!probe) {
+		const { baseModel } = entry.model ? splitKnownThinkingSuffix(entry.model) : { baseModel: "", thinkingSuffix: "" };
+		const effectiveThinking = entry.model ? resolveEffectiveThinking(entry.model, entry.thinking) : entry.thinking === "max" ? "max" : undefined;
+		const probeModelId = entry.model ? modelInfo ? `${modelInfo.fullId}${effectiveThinking ? `:${effectiveThinking}` : ""}` : entry.model : undefined;
+		const effectiveModel = effectiveThinking === "max" && entry.model ? `${baseModel}:max` : entry.model;
+		let maxThinkingError: string | undefined;
+		if (effectiveThinking === "max" && !modelInfo) {
+			maxThinkingError = `Profile '${name}' override '${entry.agent}' configures thinking 'max' without a resolvable explicit max-capable model.`;
+		} else {
+			try {
+				assertMaxThinkingSuffixSupported(effectiveModel, availableModels, undefined, `Profile '${name}'`);
+			} catch (error) {
+				maxThinkingError = error instanceof Error ? error.message : String(error);
+			}
+		}
+		let probe = maxThinkingError
+			? { status: "unavailable" as const, message: maxThinkingError }
+			: probeModelId
+				? probeCache.get(probeModelId)
+				: { status: "unavailable" as const, message: "No explicit model configured for profile override." };
+		if (!probe && probeModelId) {
 			probe = await probeModel(pi, ctx, probeModelId);
 			probeCache.set(probeModelId, probe);
 		}
 		results.push({
 			agent: entry.agent,
-			model: entry.model,
+			model: displayModel,
 			inRegistry: modelInfo !== undefined,
 			probe,
 		});
